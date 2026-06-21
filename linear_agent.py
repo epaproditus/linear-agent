@@ -1,0 +1,1587 @@
+#!/usr/bin/env python3
+"""
+Linear AI Agent — Hermes-powered autonomous agent for Linear.
+
+Integrates with Linear's Agent Session API so you can @-mention this agent
+in issues, delegate tasks to it, and have it respond with typed activities
+(thought → action → response), update issues, add comments, and even
+delegate coding tasks to Claude Code / Codex CLI.
+
+Architecture
+────────────
+Linear Webhook POST → HMAC verify → IP allowlist → Event router
+  → Background asyncio Task
+    → Acknowledge (thought activity within 10s)
+    → Parse promptContext (issue, comments, guidance)
+    → Process task (analyze, research, code)
+    → Emit action activities for progress
+    → Emit response activity with result
+    → Update issue (comment, status, assignee)
+
+Port: 8646  (next after Plane agent on 8650)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import ipaddress
+import json
+import logging
+import os
+import re
+import textwrap
+import time
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
+
+# ── Logging ──────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("linear-agent")
+
+# ── Constants ────────────────────────────────────────────────────────────
+LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
+LINEAR_IPS = frozenset({
+    "35.231.147.212",
+    "35.243.126.216",
+    "35.237.252.73",
+    "35.243.99.142",
+    "35.231.139.134",
+    "35.231.103.77",
+})
+WEBHOOK_TIMEOUT_S = 5      # Must HTTP 200 within 5s
+ACTIVITY_TIMEOUT_S = 10    # Must emit first activity within 10s
+PORT = 8660
+
+# ── Config ───────────────────────────────────────────────────────────────
+
+
+class Settings(BaseSettings):
+    """Environment-based configuration."""
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    linear_api_key: str = ""
+    """Linear API key (OAuth access token or personal API key)."""
+
+    linear_webhook_secret: str = ""
+    """HMAC signing secret from Linear webhook settings."""
+
+    linear_agent_bot_name: str = "Hermes"
+    """How the agent self-identifies; also used in self-loop prevention."""
+
+    linear_agent_user_id: str = ""
+    """If known, the agent's own user UUID for self-loop prevention."""
+
+    linear_team_ids: str = ""
+    """Comma-separated list of team IDs the agent is allowed to act on."""
+
+    linear_enforce_ip_allowlist: bool = True
+    """If true, only accept webhooks from LINEAR_IPS."""
+
+    hermes_api_url: str = "http://127.0.0.1:8642/v1"
+    """Hermes API server URL for LLM reasoning."""
+
+    hermes_api_key: str = ""
+    """API server key for authentication."""
+
+    hermes_model: str = "hermes-agent"
+    """Model name to use via Hermes API."""
+
+    coding_agent: str = "claude"
+    """Which coding backend to delegate to: 'claude', 'codex', or 'none'."""
+
+    coding_workdir: str = str(Path.home() / "linear-agent" / "workspace")
+    """Working directory for coding agents."""
+
+    @property
+    def allowed_team_ids(self) -> set[str]:
+        return {t.strip() for t in self.linear_team_ids.split(",") if t.strip()}
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.linear_api_key) and bool(self.linear_webhook_secret)
+
+
+settings = Settings()
+
+# Safety: don't run without config
+assert settings.configured, (
+    "LINEAR_API_KEY and LINEAR_WEBHOOK_SECRET must be set. "
+    "Copy .env.example to .env and fill in your credentials."
+)
+
+# ── GraphQL Queries & Mutations ──────────────────────────────────────────
+
+GQL_CREATE_ACTIVITY = """
+mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
+  agentActivityCreate(input: $input) {
+    success
+  }
+}
+"""
+
+GQL_UPDATE_SESSION = """
+mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
+  agentSessionUpdate(id: $id, input: $input) {
+    success
+  }
+}
+"""
+
+GQL_ISSUE_BY_ID = """
+query Issue($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    title
+    description
+    priority
+    url
+    state { id name type }
+    team { id key name }
+    project { id name }
+    assignee { id name email }
+    delegate { id name email }
+    labels { nodes { id name } }
+    comments {
+      nodes {
+        id
+        body
+        createdAt
+        user { id name }
+      }
+    }
+  }
+}
+"""
+
+GQL_ISSUE_BY_IDENTIFIER = """
+query IssueByIdentifier($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    title
+    description
+    priority
+    url
+    state { id name type }
+    team { id key name }
+    assignee { id name email }
+    labels { nodes { id name } }
+  }
+}
+"""
+
+GQL_CREATE_COMMENT = """
+mutation CommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) {
+    success
+    comment { id body }
+  }
+}
+"""
+
+GQL_UPDATE_ISSUE = """
+mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) {
+    success
+    issue { id identifier state { id name } }
+  }
+}
+"""
+
+GQL_TEAM_STATES = """
+query TeamStates($teamId: ID!) {
+  workflowStates(filter: { team: { id: { eq: $teamId } } }) {
+    nodes { id name type }
+  }
+}
+"""
+
+GQL_VIEWER = """
+query Me {
+  viewer { id name email }
+}
+"""
+
+GQL_PROJECT_CREATE = """
+mutation ProjectCreate($input: ProjectCreateInput!) {
+  projectCreate(input: $input) {
+    success
+    project { id name url }
+  }
+}
+"""
+
+GQL_CREATE_SESSION_ON_ISSUE = """
+mutation AgentSessionCreateOnIssue($input: AgentSessionCreateOnIssueInput!) {
+  agentSessionCreateOnIssue(input: $input) {
+    success
+    agentSession { id }
+  }
+}
+"""
+
+GQL_SESSION_ACTIVITIES = """
+query AgentSessionActivities($id: String!) {
+  agentSession(id: $id) {
+    activities {
+      edges {
+        node {
+          updatedAt
+          content {
+            __typename
+            ... on AgentActivityThoughtContent { body }
+            ... on AgentActivityActionContent { action parameter result }
+            ... on AgentActivityElicitationContent { body }
+            ... on AgentActivityResponseContent { body }
+            ... on AgentActivityErrorContent { body }
+            ... on AgentActivityPromptContent { body }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+# ── Data Models ──────────────────────────────────────────────────────────
+
+
+class ActivityType(str, Enum):
+    thought = "thought"
+    elicitation = "elicitation"
+    action = "action"
+    response = "response"
+    error = "error"
+
+
+class SessionAction(str, Enum):
+    created = "created"
+    prompted = "prompted"
+
+
+@dataclass
+class AgentSession:
+    """Represents an active agent session from a webhook event."""
+
+    session_id: str
+    issue_id: str
+    issue_identifier: str
+    action: SessionAction
+    prompt_context: str  # Raw XML promptContext string
+    body: str = ""         # Current user message (new prompt for 'prompted', comment for 'created')
+    original_body: str = ""  # For 'prompted': the session-creating @mention text
+    # Individual fields
+    title: str = ""
+    description: str = ""
+    team_id: str = ""
+    team_key: str = ""
+    team_name: str = ""
+    priority: int = 0
+    labels: list[str] = field(default_factory=list)
+    assignee_name: str = ""
+    assignee_email: str = ""
+    state_name: str = ""
+    state_type: str = ""
+    comments: list[dict] = field(default_factory=list)
+    guidance: list[str] = field(default_factory=list)
+    previous_activities: list[dict] = field(default_factory=list)
+
+
+# ── Linear GraphQL Client ───────────────────────────────────────────────
+
+
+class LinearClient:
+    """Async HTTPX client for the Linear GraphQL API."""
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+        self._client: httpx.AsyncClient | None = None
+        self._viewer_id: str | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=LINEAR_GRAPHQL_URL,
+                headers={
+                    "Authorization": self._api_key,
+                    "Content-Type": "application/json",
+                    "User-Agent": "HermesLinearAgent/1.0",
+                },
+                timeout=httpx.Timeout(30.0),
+            )
+        return self._client
+
+    async def _gql(
+        self, query: str, variables: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Execute a GraphQL query/mutation and return the data."""
+        client = await self._get_client()
+        payload: dict[str, Any] = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        resp = await client.post("", json=payload)
+        body = resp.json()
+
+        if "errors" in body:
+            raise RuntimeError(
+                f"GraphQL error: {body['errors']} "
+                f"(query: {query[:120]}...)"
+            )
+        return body.get("data", {})
+
+    async def close(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+    # ── Viewer / Identity ──
+
+    async def get_viewer_id(self) -> str:
+        """Get the agent's own user ID from Linear."""
+        if self._viewer_id:
+            return self._viewer_id
+        data = await self._gql(GQL_VIEWER)
+        self._viewer_id = data["viewer"]["id"]
+        return self._viewer_id
+
+    async def get_viewer(self) -> dict[str, Any]:
+        """Get full viewer info."""
+        data = await self._gql(GQL_VIEWER)
+        return data["viewer"]
+
+    # ── Issues ──
+
+    async def get_issue(self, issue_id: str) -> dict[str, Any] | None:
+        """Fetch a single issue by UUID or identifier."""
+        try:
+            data = await self._gql(GQL_ISSUE_BY_ID, {"id": issue_id})
+            return data.get("issue")
+        except RuntimeError:
+            return None
+
+    async def get_issue_by_identifier(self, identifier: str) -> dict[str, Any] | None:
+        """Fetch an issue by its identifier (e.g. 'ENG-123')."""
+        try:
+            data = await self._gql(GQL_ISSUE_BY_IDENTIFIER, {"id": identifier})
+            return data.get("issue")
+        except RuntimeError:
+            return None
+
+    async def comment(self, issue_id: str, body: str) -> bool:
+        """Add a comment to an issue."""
+        data = await self._gql(GQL_CREATE_COMMENT, {
+            "input": {"issueId": issue_id, "body": body},
+        })
+        return data.get("commentCreate", {}).get("success", False)
+
+    async def update_issue(
+        self, issue_id: str, **kwargs: Any
+    ) -> bool:
+        """Update issue fields (stateId, assigneeId, priority, etc.)."""
+        data = await self._gql(GQL_UPDATE_ISSUE, {
+            "id": issue_id,
+            "input": kwargs,
+        })
+        return data.get("issueUpdate", {}).get("success", False)
+
+    async def get_team_states(self, team_id: str) -> list[dict[str, Any]]:
+        """Get workflow states for a team."""
+        data = await self._gql(GQL_TEAM_STATES, {"teamId": team_id})
+        return data.get("workflowStates", {}).get("nodes", [])
+
+    async def create_project(
+        self,
+        name: str,
+        team_ids: list[str],
+        description: str = "",
+    ) -> dict[str, Any] | None:
+        """Create a new Linear project. Returns the project dict or None on failure."""
+        inp: dict[str, Any] = {"name": name, "teamIds": team_ids}
+        if description:
+            inp["description"] = description
+        data = await self._gql(GQL_PROJECT_CREATE, {"input": inp})
+        result = data.get("projectCreate", {})
+        if result.get("success"):
+            return result.get("project")
+        return None
+
+    async def find_state_by_type(
+        self, team_id: str, state_type: str, preferred_name: str | None = None
+    ) -> str | None:
+        """Find a workflow state UUID by type. If preferred_name given, tries name match first."""
+        states = await self.get_team_states(team_id)
+        if preferred_name:
+            for s in states:
+                if s["type"] == state_type and s["name"].lower() == preferred_name.lower():
+                    return s["id"]
+        for s in states:
+            if s["type"] == state_type:
+                return s["id"]
+        return None
+
+    # ── Agent Activities ──
+
+    async def create_activity(
+        self,
+        session_id: str,
+        activity_type: ActivityType,
+        body: str,
+        *,
+        action_label: str | None = None,
+        action_param: str | None = None,
+        action_result: str | None = None,
+        ephemeral: bool = False,
+        signal: str | None = None,
+        signal_metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """Emit an agent activity to the session.
+
+        Args:
+            session_id: The AgentSession ID.
+            activity_type: Type of activity (thought, action, response, error).
+            body: Main text content (Markdown OK).
+            action_label: For 'action' type: the action name (e.g. 'Searching').
+            action_param: For 'action' type: the parameter (e.g. query string).
+            action_result: For 'action' type: the result (Markdown OK).
+            ephemeral: If True, replaced by next activity.
+            signal: Optional signal ('auth', 'select') for elicitation activities.
+            signal_metadata: Metadata dict for the signal (auth URL, select options).
+        """
+        content: dict[str, Any] = {"type": activity_type.value}
+
+        if activity_type == ActivityType.action:
+            content["action"] = action_label or "Processing"
+            content["parameter"] = action_param or ""
+            content["body"] = body
+            if action_result:
+                content["result"] = action_result
+        else:
+            content["body"] = body
+
+        inp: dict[str, Any] = {
+            "agentSessionId": session_id,
+            "content": json.dumps(content),
+            "ephemeral": ephemeral,
+        }
+        if signal:
+            inp["signal"] = signal
+        if signal_metadata:
+            inp["signalMetadata"] = json.dumps(signal_metadata)
+
+        data = await self._gql(GQL_CREATE_ACTIVITY, {"input": inp})
+        return data.get("agentActivityCreate", {}).get("success", False)
+
+    async def acknowledge(self, session_id: str, message: str = "") -> bool:
+        """Send 'thought' activity — required within 10s of a 'created' event."""
+        return await self.create_activity(
+            session_id,
+            ActivityType.thought,
+            body=message or "🤖 Hermes agent here! Processing the issue...",
+            ephemeral=True,
+        )
+
+    async def send_action(
+        self,
+        session_id: str,
+        label: str,
+        param: str,
+        body: str = "",
+        result: str | None = None,
+        ephemeral: bool = True,
+    ) -> bool:
+        """Emit an 'action' activity (visible progress step, ephemeral by default)."""
+        return await self.create_activity(
+            session_id,
+            ActivityType.action,
+            body=body or f"**{label}**...",
+            action_label=label,
+            action_param=param,
+            action_result=result,
+            ephemeral=ephemeral,
+        )
+
+    async def send_response(self, session_id: str, body: str) -> bool:
+        """Emit the final 'response' activity."""
+        return await self.create_activity(
+            session_id, ActivityType.response, body=body,
+        )
+
+    async def send_error(self, session_id: str, body: str) -> bool:
+        """Emit an 'error' activity."""
+        return await self.create_activity(
+            session_id, ActivityType.error, body=body,
+        )
+
+    async def send_elicitation(self, session_id: str, body: str) -> bool:
+        """Ask a clarification question."""
+        return await self.create_activity(
+            session_id, ActivityType.elicitation, body=body,
+        )
+
+    async def send_elicitation_select(
+        self,
+        session_id: str,
+        body: str,
+        options: list[dict[str, str]],
+    ) -> bool:
+        """Present a list of options for the user to choose from."""
+        return await self.create_activity(
+            session_id,
+            ActivityType.elicitation,
+            body=body,
+            signal="select",
+            signal_metadata={"options": options},
+        )
+
+    async def send_elicitation_auth(
+        self,
+        session_id: str,
+        body: str,
+        url: str,
+        *,
+        user_id: str | None = None,
+        provider_name: str | None = None,
+    ) -> bool:
+        """Request account linking before the agent can continue."""
+        meta: dict[str, Any] = {"url": url}
+        if user_id:
+            meta["userId"] = user_id
+        if provider_name:
+            meta["providerName"] = provider_name
+        return await self.create_activity(
+            session_id,
+            ActivityType.elicitation,
+            body=body,
+            signal="auth",
+            signal_metadata=meta,
+        )
+
+    async def update_plan(
+        self,
+        session_id: str,
+        steps: list[dict[str, str]],
+    ) -> bool:
+        """Replace the session's plan checklist (full array required each time)."""
+        data = await self._gql(GQL_UPDATE_SESSION, {
+            "id": session_id,
+            "input": {"plan": steps},
+        })
+        return data.get("agentSessionUpdate", {}).get("success", False)
+
+    async def get_session_activities(
+        self, session_id: str
+    ) -> list[dict[str, Any]]:
+        """Fetch all activities for a session (for conversation reconstruction)."""
+        try:
+            data = await self._gql(GQL_SESSION_ACTIVITIES, {"id": session_id})
+            edges = (
+                data.get("agentSession", {})
+                    .get("activities", {})
+                    .get("edges", [])
+            )
+            return [e["node"] for e in edges]
+        except RuntimeError:
+            return []
+
+    async def update_session(
+        self,
+        session_id: str,
+        *,
+        external_urls: list[dict[str, str]] | None = None,
+        summary: str | None = None,
+    ) -> bool:
+        """Update session metadata."""
+        inp: dict[str, Any] = {}
+        if external_urls is not None:
+            inp["externalUrls"] = [{"label": u["label"], "url": u["url"]}
+                                   for u in external_urls]
+        if summary is not None:
+            inp["summary"] = summary
+        data = await self._gql(GQL_UPDATE_SESSION, {
+            "id": session_id,
+            "input": inp,
+        })
+        return data.get("agentSessionUpdate", {}).get("success", False)
+
+
+# ── Coding Agent Bridge ─────────────────────────────────────────────────
+
+
+class CodingBridge:
+    """Delegates coding tasks to Claude Code or Codex CLI."""
+
+    def __init__(self, backend: str, workdir: str) -> None:
+        self.backend = backend
+        self.workdir = Path(workdir)
+        self.workdir.mkdir(parents=True, exist_ok=True)
+
+    async def run(
+        self,
+        issue_id: str,
+        title: str,
+        description: str,
+        context: str = "",
+    ) -> dict[str, Any]:
+        """Execute a coding task for the given issue.
+
+        Returns a dict with 'success', 'output', and 'error' keys.
+        """
+        # Clone or create working directory
+        repo_dir = self.workdir / issue_id.replace("-", "_")
+        repo_dir.mkdir(parents=True, exist_ok=True)
+
+        task_prompt = textwrap.dedent(f"""\
+        Issue: {title}
+
+        {description or "(no description)"}
+
+        {context}
+
+        ---
+        Please implement the solution. Run any relevant tests.
+        Do NOT create a git commit — the agent will handle that.
+        """).strip()
+
+        if self.backend == "claude":
+            return await self._run_claude(repo_dir, task_prompt)
+        elif self.backend == "codex":
+            return await self._run_codex(repo_dir, task_prompt)
+        else:
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Unknown coding backend: {self.backend}",
+            }
+
+    async def _run_claude(
+        self, workdir: Path, prompt: str
+    ) -> dict[str, Any]:
+        """Delegate to Claude Code CLI."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude",
+                "--print",
+                prompt,
+                cwd=str(workdir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "CLAUDE_CODE_VERBOSE": "0"},
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=300.0
+            )
+            return {
+                "success": proc.returncode == 0,
+                "output": stdout.decode(errors="replace"),
+                "error": stderr.decode(errors="replace")
+                if proc.returncode != 0
+                else "",
+            }
+        except asyncio.TimeoutError:
+            proc.kill()
+            return {
+                "success": False,
+                "output": "",
+                "error": "Claude Code timed out after 300s",
+            }
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "output": "",
+                "error": "Claude Code CLI not found. Install with: "
+                "npm install -g @anthropic/claude-code",
+            }
+
+    async def _run_codex(
+        self, workdir: Path, prompt: str
+    ) -> dict[str, Any]:
+        """Delegate to OpenAI Codex CLI."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "codex",
+                "exec",
+                prompt,
+                cwd=str(workdir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ},
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=300.0
+            )
+            return {
+                "success": proc.returncode == 0,
+                "output": stdout.decode(errors="replace"),
+                "error": stderr.decode(errors="replace")
+                if proc.returncode != 0
+                else "",
+            }
+        except asyncio.TimeoutError:
+            proc.kill()
+            return {
+                "success": False,
+                "output": "",
+                "error": "Codex CLI timed out after 300s",
+            }
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "output": "",
+                "error": "Codex CLI not found. Install with: "
+                "npm install -g @openai/codex",
+            }
+
+
+# ── Webhook Security ────────────────────────────────────────────────────
+
+
+def verify_hmac(payload: bytes, signature: str, secret: str) -> bool:
+    """HMAC-SHA256 verification with timing-safe comparison."""
+    expected = hmac.new(
+        secret.encode(), payload, "sha256"
+    ).hexdigest()
+    # Linear sends the raw hex hash as the header value (no "sha256=" prefix)
+    # But also accept the prefixed form for compatibility
+    if signature.startswith("sha256="):
+        signature = signature[7:]
+    result = hmac.compare_digest(expected, signature)
+    if not result:
+        log.warning(
+            "HMAC mismatch: computed_hash=%s... received_hash=%s... payload_len=%d secret_len=%d",
+            expected[:16], str(signature)[:16], len(payload), len(secret),
+        )
+    return result
+
+
+def verify_ip(request: Request) -> bool:
+    """Check if the request comes from a known Linear IP."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    ip_str = forwarded.split(",")[0].strip() if forwarded else (
+        request.client.host if request.client else ""
+    )
+    try:
+        return ipaddress.ip_address(ip_str) in {
+            ipaddress.ip_address(i) for i in LINEAR_IPS
+        }
+    except ValueError:
+        return False
+
+
+# ── Prompt Context Parser ───────────────────────────────────────────────
+
+
+def _is_linear_system_comment(body: str) -> bool:
+    """Detect Linear's auto-generated agent-session comment (not real user input)."""
+    if not body:
+        return False
+    normalized = body.strip().lower()
+    return normalized.startswith("this thread is for an agent session")
+
+
+def parse_prompt_context(xml_str: str) -> dict[str, Any]:
+    """Roughly parse the Linear promptContext XML into a dict.
+
+    Uses simple regex — not a full XML parser, but sufficient for Linear's
+    well-structured promptContext format.
+    """
+    result: dict[str, Any] = {}
+    result["labels"] = []
+
+    m = re.search(r'<issue identifier="([^"]+)"', xml_str)
+    if m:
+        result["identifier"] = m.group(1)
+
+    m = re.search(r"<title>([^<]*)</title>", xml_str)
+    if m:
+        result["title"] = m.group(1)
+
+    m = re.search(r"<description>([^<]*)</description>", xml_str)
+    if m:
+        result["description"] = m.group(1)
+
+    m = re.search(r'<team name="([^"]*)"', xml_str)
+    if m:
+        result["team_name"] = m.group(1)
+
+    result["labels"] = re.findall(r"<label>([^<]+)</label>", xml_str)
+
+    # Extract guidance rules
+    result["guidance"] = re.findall(
+        r"<guidance-rule[^>]*>([^<]+)</guidance-rule>", xml_str
+    )
+
+    # Extract primary directive
+    m = re.search(
+        r"<primary-directive-thread[^>]*>.*?<comment[^>]*>.*?([^<]+)</comment>",
+        xml_str,
+        re.DOTALL,
+    )
+    if m:
+        result["primary_directive"] = m.group(1).strip()
+
+    # Count comments
+    result["comment_count"] = len(re.findall(r"<comment[^>]*>", xml_str))
+
+    return result
+
+
+# ── Task Processor ──────────────────────────────────────────────────────
+
+
+class TaskProcessor:
+    """Processes an agent session — analyzes the issue, takes action."""
+
+    def __init__(
+        self,
+        linear: LinearClient,
+        coding: CodingBridge | None = None,
+    ) -> None:
+        self.linear = linear
+        self.coding = coding
+        self._viewer_id: str | None = None
+        self._last_responses: dict[str, str] = {}  # session_id → last Hermes response
+
+    async def ensure_viewer_id(self) -> str:
+        if self._viewer_id is None:
+            self._viewer_id = await self.linear.get_viewer_id()
+        return self._viewer_id
+
+
+    async def process(
+        self, session: AgentSession, issue: dict[str, Any] | None
+    ) -> None:
+        """Main processing pipeline for a session."""
+        session_id = session.session_id
+        issue_id = session.issue_id
+        log.info(
+            "Processing session=%s issue=%s action=%s",
+            session_id, session.issue_identifier, session.action.value,
+        )
+
+        # 1. Do not emit a visible acknowledgement. Linear only requires an
+        # activity OR external URL update within 10s; `update_session` below
+        # satisfies that without creating an extra message in the thread.
+
+        try:
+            # 2. Fetch full issue if we only have partial data
+            if issue is None:
+                issue = await self.linear.get_issue(issue_id)
+
+            if not issue:
+                await self.linear.send_error(
+                    session_id,
+                    f"❌ Could not fetch issue {session.issue_identifier}.",
+                )
+                return
+
+            title = issue.get("title", session.title)
+            description = issue.get("description", session.description) or ""
+            team_id = issue.get("team", {}).get("id", session.team_id)
+            state_type = issue.get("state", {}).get("type", "")
+            labels = [l["name"] for l in
+                      (issue.get("labels", {}).get("nodes", []) or [])]
+            log.info("Issue: %s — %s [%s]", session.issue_identifier, title, state_type)
+
+            # 3. Set self as delegate if not already set (per Linear best practices)
+            if issue.get("delegate") is None:
+                viewer_id = await self.ensure_viewer_id()
+                await self.linear.update_issue(issue_id, delegateId=viewer_id)
+
+            # 4. Auto-move to "In Progress" when picking up task
+            if state_type not in ("started", "completed", "canceled") and team_id:
+                started_id = await self.linear.find_state_by_type(
+                    team_id, "started", preferred_name="In Progress"
+                )
+                if started_id:
+                    await self.linear.update_issue(issue_id, stateId=started_id)
+
+            # 5. Enable agent session with external URL (satisfies 10s ack requirement)
+            await self.linear.update_session(
+                session_id,
+                external_urls=[
+                    {"label": "Issue", "url": issue.get("url", "")},
+                ],
+            )
+
+            # 6. Route to analysis handler — LLM decides what to do
+            log.info("Routing to _handle_analysis")
+            await self._handle_analysis(session, issue, session_id)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("Error processing session %s", session_id)
+            await self.linear.send_error(
+                session_id,
+                f"❌ An error occurred while processing this issue:\n```\n{e}\n```",
+            )
+
+    async def _handle_dev_task(
+        self,
+        session: AgentSession,
+        issue: dict[str, Any],
+        session_id: str,
+    ) -> None:
+        """Route to coding agent (Claude Code / Codex)."""
+        assert self.coding is not None
+
+        title = issue.get("title", session.title)
+        description = issue.get("description", session.description) or ""
+        identifier = issue.get("identifier", session.issue_identifier)
+
+        await self.linear.send_action(
+            session_id,
+            "Delegating to coding agent",
+            identifier,
+            f"🧑‍💻 Spinning up **{settings.coding_agent.title()} Code** to work on "
+            f"**{identifier}**...",
+        )
+
+        # Run the coding agent
+        result = await self.coding.run(
+            issue_id=issue["id"],
+            title=title,
+            description=description,
+            context=f"Issue: {identifier}\nLabels: {', '.join(session.labels)}",
+        )
+
+        if result["success"] and result["output"]:
+            output = result["output"]
+            # Truncate if too long (Linear has comment limits)
+            if len(output) > 15000:
+                output = output[:15000] + "\n\n*(output truncated)*"
+
+            # Add result as a comment
+            await self.linear.comment(
+                issue["id"],
+                f"✅ **{settings.coding_agent.title()} Code** completed work on "
+                f"**{identifier}**:\n\n```\n{output[:3000]}\n```\n\n"
+                f"*(Full output available in agent session)*",
+            )
+
+            await self.linear.send_action(
+                session_id,
+                "Completed",
+                identifier,
+                result=f"```\n{output[:2000]}\n```",
+            )
+
+            await self.linear.send_response(
+                session_id,
+                f"✅ **Done!** {settings.coding_agent.title()} Code finished "
+                f"working on **{identifier}**.",
+            )
+
+        elif result["error"]:
+            await self.linear.send_error(
+                session_id,
+                f"❌ Coding agent failed for **{identifier}**:\n```\n{result['error']}\n```",
+            )
+
+    async def _handle_analysis(
+        self,
+        session: AgentSession,
+        issue: dict[str, Any],
+        session_id: str,
+    ) -> None:
+        """Non-coding task: use LLM to reason and respond intelligently."""
+        identifier = issue.get("identifier", session.issue_identifier)
+        title = issue.get("title", session.title)
+        description = issue.get("description", session.description) or ""
+        state = issue.get("state", {})
+        labels = [l["name"] for l in
+                  (issue.get("labels", {}).get("nodes", []) or [])]
+        priority = issue.get("priority", 0)
+        priority_map = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
+
+        # For prompted (follow-up) events, reconstruct the prior exchange from:
+        #   - the original @mention that started this session
+        #   - our cached last response for this session
+        # Do NOT use the full issue comment history — it contains unrelated threads
+        # from previous sessions which confuse the LLM about what was just asked.
+        conversation_text = ""
+        if session.action == SessionAction.prompted:
+            prior_exchange = ""
+            if session.original_body:
+                prior_exchange += f"User: {session.original_body}\n"
+            last_response = self._last_responses.get(session_id, "")
+            if not last_response:
+                # Cache cold (e.g. after restart) — look for the agent's most recent
+                # comment in the issue as a best-effort fallback
+                issue_comments = [c for c in
+                                  (issue.get("comments", {}).get("nodes", []) or [])
+                                  if c is not None]
+                viewer_id = await self.ensure_viewer_id()
+                for c in reversed(issue_comments):
+                    if (c.get("user") or {}).get("id") == viewer_id:
+                        last_response = c.get("body", "")
+                        break
+            if last_response:
+                # Truncate to 200 chars to avoid Hermes mirroring a long prior response
+                summary = last_response[:200].rstrip()
+                if len(last_response) > 200:
+                    summary += "…"
+                prior_exchange += f"Hermes: {summary}\n"
+            if prior_exchange:
+                conversation_text = (
+                    f"Prior exchange:\n{prior_exchange}"
+                )
+        else:
+            issue_comments = [c for c in
+                              (issue.get("comments", {}).get("nodes", []) or [])
+                              if c is not None]
+            if issue_comments:
+                conversation_text = "\n\nRecent comments:\n"
+                for c in issue_comments[-5:]:
+                    author = (c.get("user") or {}).get("name", "Unknown")
+                    body = c.get("body", "")[:300]
+                    conversation_text += f"- {author}: {body}\n"
+
+        # The user's actual request (from the comment that triggered this)
+        user_request = session.body or description or f"Respond to issue {identifier}"
+
+        # Hermes is an agentic harness with real tools (filesystem, etc.) behind an
+        # OpenAI-compatible endpoint. We do NOT pre-empt it with keyword matching —
+        # we hand it the task + context and let it use its tools to actually do it.
+        is_delegation = not (session.body and session.body != description)
+
+        if session.action == SessionAction.prompted:
+            # Follow-up turn — continue the work/conversation in this thread
+            prompt = f"""You are Hermes, an autonomous agent working on Linear issue {identifier} — {title}.
+You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
+
+{conversation_text}
+User: {user_request}
+
+Respond to the new message. If it asks you to do something, do it now with your tools and report the result. If it's casual conversation, just reply naturally. Do not repeat your previous messages."""
+        elif not is_delegation:
+            # User explicitly @mentioned with a message
+            prompt = f"""You are Hermes, an autonomous agent working inside Linear.
+You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
+
+Issue: {identifier} — {title} | Status: {state.get('name', 'Unknown')}
+Description: {description or '(none)'}
+{conversation_text}
+
+User's message: {user_request}
+
+Do what the user asked. If it requires real work (reading files, running commands), use your tools and report what you actually did and found. If it's casual, just reply naturally. Be concise. Do not introduce yourself or list capabilities."""
+        else:
+            # Issue delegated to Hermes — the title + description IS the task
+            prompt = f"""You are Hermes, an autonomous agent working inside Linear.
+You have tools available (filesystem, shell, etc.). Use them to actually complete this task.
+
+Issue: {identifier} — {title}
+Description: {description or '(no description)'}
+Labels: {', '.join(labels) or 'none'}
+{conversation_text}
+
+Start working on this task NOW using your tools. Do the actual work — don't just describe what you would do, and don't ask for confirmation. When finished, report concisely what you did and the result."""
+
+        # Emit ephemeral thought so Linear doesn't mark session unresponsive while LLM runs
+        await self.linear.create_activity(
+            session_id,
+            ActivityType.thought,
+            body="Thinking...",
+            ephemeral=True,
+        )
+
+        # Call LLM for reasoning
+        response_text = await self._call_llm(prompt)
+
+        if response_text:
+            await self.linear.send_response(session_id, response_text)
+            # Cache for follow-up context; cap at 200 sessions to avoid unbounded growth
+            self._last_responses[session_id] = response_text
+            if len(self._last_responses) > 200:
+                oldest = next(iter(self._last_responses))
+                del self._last_responses[oldest]
+            # A delegated task is now complete — move to "In Review" for the user
+            if is_delegation and session.action != SessionAction.prompted:
+                team_id_local = issue.get("team", {}).get("id", session.team_id)
+                issue_id_local = issue.get("id", "")
+                if team_id_local and issue_id_local:
+                    review_id = await self.linear.find_state_by_type(
+                        team_id_local, "started", preferred_name="In Review"
+                    )
+                    if review_id:
+                        await self.linear.update_issue(issue_id_local, stateId=review_id)
+        else:
+            await self.linear.send_response(
+                session_id,
+                f"Could not generate a response. Status: {state.get('name', 'Unknown')}",
+            )
+
+    async def _call_llm(self, prompt: str) -> str | None:
+        """Call Hermes API server for reasoning. Returns the response text or None on failure."""
+        if not settings.hermes_api_key:
+            log.warning("HERMES_API_KEY not set — cannot call LLM")
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"{settings.hermes_api_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.hermes_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": settings.hermes_model,
+                        "messages": [
+                            {"role": "user", "content": prompt}
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 2000,
+                    },
+                )
+
+                if resp.status_code != 200:
+                    log.warning("Hermes API returned %d: %s", resp.status_code, resp.text[:200])
+                    return None
+
+                data = resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return content.strip() if content else None
+
+        except httpx.TimeoutException:
+            log.warning("Hermes API call timed out after 120s")
+            return None
+        except Exception as e:
+            log.warning("Hermes API call failed: %s", e)
+            return None
+
+
+# ── Webhook Handler ─────────────────────────────────────────────────────
+
+
+class AgentWebhookHandler:
+    """Processes incoming Linear webhooks and manages agent sessions."""
+
+    def __init__(
+        self, linear: LinearClient, processor: TaskProcessor
+    ) -> None:
+        self.linear = linear
+        self.processor = processor
+        self._active_runs: dict[str, asyncio.Task[None]] = {}
+        self._dedup_cache: dict[str, float] = {}
+
+    def _check_dedup(self, key: str, ttl: float = 60.0) -> bool:
+        """Returns True if this event was recently processed."""
+        now = time.time()
+        # Prune stale entries periodically
+        if now % 100 < 1:
+            self._dedup_cache = {
+                k: v for k, v in self._dedup_cache.items()
+                if now - v < 120
+            }
+        if key in self._dedup_cache and now - self._dedup_cache[key] < ttl:
+            return True  # Duplicate
+        self._dedup_cache[key] = now
+        return False
+
+    def _is_self_comment(self, payload: dict[str, Any]) -> bool:
+        """Check if the webhook event was triggered by the agent itself."""
+        try:
+            # If the webhook body has a userId that matches the agent
+            user_id = payload.get("notification", {}).get("actorId", "")
+            creator_id = payload.get("appUserId", "")
+            return bool(user_id) or bool(creator_id)
+        except Exception:
+            return False
+
+    async def handle_event(
+        self, payload: dict[str, Any]
+    ) -> str:
+        """Route a webhook event to the appropriate handler.
+
+        Returns a status message for logging.
+        """
+        event_type = payload.get("type", "")
+        action = payload.get("action", "")
+
+        log.info("Webhook: type=%s action=%s", event_type, action)
+
+        # Debug: dump full payload structure (remove after fixing)
+        log.info("Full webhook payload keys: %s", json.dumps(list(payload.keys())))
+        # Log the top-level structure with sizes (to avoid massive payloads in logs)
+        def summarize(obj, depth=0):
+            if depth > 3:
+                return "..."
+            if isinstance(obj, dict):
+                return {k: summarize(v, depth+1) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return f"[list len={len(obj)}]" if len(obj) > 3 else [summarize(v, depth+1) for v in obj]
+            elif isinstance(obj, str):
+                return f"str({len(obj)} chars)"
+            else:
+                return obj
+        log.info("Payload structure: %s", json.dumps(summarize(payload), indent=2, default=str))
+
+        # ── Agent Session Events ──
+        if event_type == "AgentSessionEvent" and action in ("created", "prompted"):
+            return await self._handle_agent_session(payload, SessionAction(action))
+
+        # ── Comment Events (for @mentions that may not trigger agent sessions) ──
+        if event_type == "Comment" and action == "create":
+            if self._is_self_comment(payload):
+                log.info("Skipping own comment — self-loop prevention")
+                return "skipped (self-comment)"
+            return await self._handle_comment(payload)
+
+        # ── Issue Events ──
+        if event_type == "Issue" and action == "update":
+            return await self._handle_issue_update(payload)
+
+        log.info("Unhandled event type=%s action=%s", event_type, action)
+        return f"unhandled ({event_type}/{action})"
+
+    async def _handle_agent_session(
+        self, payload: dict[str, Any], action: SessionAction
+    ) -> str:
+        """Handle AgentSessionEvent.created or .prompted."""
+        # AgentSessionEvent: data is at top level
+        agent_session = payload.get("agentSession", {})
+        session_id = agent_session.get("id", "")
+        # promptContext and agentActivity are also at top level
+        prompt_context_raw = payload.get("promptContext", "")
+        agent_activity = payload.get("agentActivity", {})
+
+        if not session_id:
+            return "ignored (no session id)"
+
+        # Build our session object first so we can read signal from agent_activity
+        parsed_context = parse_prompt_context(prompt_context_raw)
+
+        issue_data = agent_session.get("issue", {})
+        comment_data = agent_session.get("comment", {})
+        comment_body = comment_data.get("body", "")
+        previous_comments = payload.get("previousComments", [])
+        agent_activity = payload.get("agentActivity", {})
+        activity_body = agent_activity.get("body", "")
+
+        # Linear auto-creates a session comment like "This thread is for an agent
+        # session with Hermes." when an issue is delegated (no real @mention). That
+        # is a SYSTEM message, not user input — discard it so the real task (the
+        # issue description) is used instead.
+        if _is_linear_system_comment(comment_body):
+            comment_body = ""
+
+        # For prompted events, the new user message is in agentActivity.body.
+        # For created events, only a real @mention comment counts as user content.
+        if action == SessionAction.prompted:
+            user_body = activity_body or ""
+        else:
+            user_body = comment_body or ""
+
+        # Dedup — for prompted events key on the activity ID (allows multiple
+        # distinct follow-ups while still dropping duplicate webhook fires).
+        if action == SessionAction.prompted:
+            activity_id = agent_activity.get("id", "")
+            dedup_key = f"activity:{activity_id}" if activity_id else f"session:{session_id}:prompted"
+        else:
+            dedup_key = f"session:{session_id}:{action.value}"
+        if self._check_dedup(dedup_key):
+            log.info("Dedup hit for session %s", session_id)
+            return "deduped"
+
+        # Handle stop signal — cancel running task, do not spawn a new one
+        if agent_activity.get("signal") == "stop":
+            existing = self._active_runs.get(session_id)
+            if existing and not existing.done():
+                existing.cancel()
+                log.info("Stop signal received; cancelling session %s", session_id[:8])
+                await self.linear.send_response(
+                    session_id,
+                    "Stopped. Work has been halted as requested.",
+                )
+                return "stopped (stop signal — task cancelled)"
+            await self.linear.send_response(
+                session_id,
+                "No active task to stop.",
+            )
+            return "stopped (stop signal — no active task)"
+
+        # Check if already running
+        existing = self._active_runs.get(session_id)
+        if existing and not existing.done():
+            log.info("Session %s already active", session_id)
+            return "already running"
+
+        session = AgentSession(
+            session_id=session_id,
+            issue_id=issue_data.get("id", ""),
+            issue_identifier=issue_data.get("identifier",
+                                            parsed_context.get("identifier", "")),
+            action=action,
+            prompt_context=prompt_context_raw,
+            body=user_body,
+            original_body=comment_body if action == SessionAction.prompted else "",
+            title=issue_data.get("title", parsed_context.get("title", "")),
+            description=issue_data.get("description",
+                                        parsed_context.get("description", "")),
+            team_id=issue_data.get("team", {}).get("id", ""),
+            team_key=issue_data.get("team", {}).get("key", ""),
+            team_name=parsed_context.get("team_name", ""),
+            priority=issue_data.get("priority", 0),
+            labels=parsed_context.get("labels", []),
+            state_name=issue_data.get("state", {}).get("name", ""),
+            state_type=issue_data.get("state", {}).get("type", ""),
+            comments=previous_comments,
+            guidance=parsed_context.get("guidance", []),
+        )
+
+        # Spawn background processing and track the task for cancellation
+        task: asyncio.Task[None] = asyncio.create_task(self._run_session(session))
+        self._active_runs[session_id] = task
+        return f"processing (session={session_id[:8]}...)"
+
+    async def _run_session(self, session: AgentSession) -> None:
+        """Background task for an agent session."""
+        try:
+            issue = await self.linear.get_issue(session.issue_id)
+            await self.processor.process(session, issue)
+        except asyncio.CancelledError:
+            log.info("Session %s cancelled via stop signal", session.session_id[:8])
+            raise
+        except Exception as e:
+            log.exception("Session %s crashed", session.session_id)
+            try:
+                await self.linear.send_error(
+                    session.session_id,
+                    f"❌ Internal error: {e}",
+                )
+            except Exception:
+                log.exception("Failed to send error activity")
+        finally:
+            self._active_runs.pop(session.session_id, None)
+            log.info("Session %s complete", session.session_id[:8])
+
+    async def _handle_comment(self, payload: dict[str, Any]) -> str:
+        """Handle @mentions in comments."""
+        # AppUserNotification: data is in notification object
+        notif = payload.get("notification", {})
+        comment_body = notif.get("comment", {}).get("body", "")
+        issue_id = notif.get("issueId", "")
+        comment_id = notif.get("commentId", "")
+
+        # Check for @Hermes mention
+        bot_name = settings.linear_agent_bot_name.lower()
+        if f"@{bot_name}" not in comment_body.lower():
+            return "ignored (no mention)"
+
+        dedup_key = f"comment:{comment_id}"
+        if self._check_dedup(dedup_key):
+            return "deduped"
+
+        # Create a proactive agent session on the issue
+        log.info("Creating agent session for @mention on issue %s", issue_id)
+        try:
+            data = await self.linear._gql(GQL_CREATE_SESSION_ON_ISSUE, {
+                "input": {"issueId": issue_id},
+            })
+            session_data = data.get("agentSessionCreateOnIssue", {})
+            if session_data.get("success"):
+                session_id = session_data["agentSession"]["id"]
+                # Build a basic session
+                issue = await self.linear.get_issue(issue_id)
+                if issue:
+                    session = AgentSession(
+                        session_id=session_id,
+                        issue_id=issue_id,
+                        issue_identifier=issue.get("identifier", ""),
+                        action=SessionAction.created,
+                        prompt_context="",
+                        title=issue.get("title", ""),
+                        description=issue.get("description", "") or "",
+                        team_id=issue.get("team", {}).get("id", ""),
+                        team_key=issue.get("team", {}).get("key", ""),
+                        priority=issue.get("priority", 0),
+                        labels=[l["name"] for l in
+                                (issue.get("labels", {}).get("nodes", []) or [])],
+                        comments=issue.get("comments", {}).get("nodes", []),
+                    )
+                    asyncio.create_task(self.processor.process(session, issue))
+                    return f"processing @mention (session={session_id[:8]}...)"
+        except Exception as e:
+            log.exception("Failed to create agent session for @mention")
+            return f"error: {e}"
+
+        return "no action"
+
+    async def _handle_issue_update(self, payload: dict[str, Any]) -> str:
+        """Handle issue assignments or delegations to the agent."""
+        # Issue webhook: data is at top level
+        assignee_id = payload.get("assigneeId", "") or payload.get("issue", {}).get("assigneeId", "")
+        delegate_id = payload.get("delegateId", "") or payload.get("issue", {}).get("delegateId", "")
+        issue_id = payload.get("issueId", "") or payload.get("id", "")
+
+        # Check if the issue was assigned or delegated to us
+        try:
+            viewer_id = await self.processor.ensure_viewer_id()
+            if assignee_id != viewer_id and delegate_id != viewer_id:
+                return "not assigned/delegated to agent"
+        except Exception:
+            return "could not check assignment"
+
+        log.info("Issue %s assigned to agent", issue_id)
+        # Create an agent session proactively
+        try:
+            data = await self.linear._gql(GQL_CREATE_SESSION_ON_ISSUE, {
+                "input": {"issueId": issue_id},
+            })
+            session_data = data.get("agentSessionCreateOnIssue", {})
+            if session_data.get("success"):
+                session_id = session_data["agentSession"]["id"]
+                issue = await self.linear.get_issue(issue_id)
+                if issue:
+                    session = AgentSession(
+                        session_id=session_id,
+                        issue_id=issue_id,
+                        issue_identifier=issue.get("identifier", ""),
+                        action=SessionAction.created,
+                        prompt_context="",
+                        title=issue.get("title", ""),
+                        description=issue.get("description", "") or "",
+                        team_id=issue.get("team", {}).get("id", ""),
+                        team_key=issue.get("team", {}).get("key", ""),
+                        priority=issue.get("priority", 0),
+                        labels=[l["name"] for l in
+                                (issue.get("labels", {}).get("nodes", []) or [])],
+                        state_type=issue.get("state", {}).get("type", ""),
+                    )
+                    asyncio.create_task(self.processor.process(session, issue))
+                    return f"processing assignment (session={session_id[:8]}...)"
+        except Exception as e:
+            log.exception("Failed to handle assignment")
+            return f"error: {e}"
+
+        return "no action"
+
+
+# ── FastAPI App ─────────────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Application lifespan — set up and tear down clients."""
+    log.info(
+        "═══════════════════════════════════════════════\n"
+        "  Linear Agent starting...\n"
+        "  Port: %s\n"
+        "  Backend: %s\n"
+        "  Workdir: %s\n"
+        "═══════════════════════════════════════════════",
+        PORT, settings.coding_agent, settings.coding_workdir,
+    )
+
+    # Create shared clients
+    linear = LinearClient(settings.linear_api_key)
+    coding = CodingBridge(settings.coding_agent, settings.coding_workdir)
+    processor = TaskProcessor(linear, coding)
+    handler = AgentWebhookHandler(linear, processor)
+
+    # Stash on app
+    app.state.linear = linear
+    app.state.handler = handler
+
+    # Verify API connectivity
+    try:
+        viewer = await linear.get_viewer()
+        log.info("Authenticated as: %s (%s)", viewer["name"], viewer["email"])
+    except Exception as e:
+        log.warning("API auth check failed (will retry): %s", e)
+
+    yield
+
+    # Shutdown
+    await linear.close()
+    log.info("Linear agent shut down.")
+
+
+app = FastAPI(
+    title="Linear Agent",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+)
+
+
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    """Health check endpoint."""
+    return {
+        "status": "ok",
+        "agent": "linear-agent",
+        "backend": settings.coding_agent,
+    }
+
+
+@app.post("/linear/webhook")
+async def linear_webhook(request: Request) -> Response:
+    """Receive Linear webhook events (AgentSessionEvent, Comment, Issue)."""
+    # 1. Verify IP (optional but recommended)
+    if settings.linear_enforce_ip_allowlist and not verify_ip(request):
+        log.warning("Request from untrusted IP: %s", request.client)
+        raise HTTPException(status_code=403, detail="Untrusted IP")
+
+    # 2. Read body
+    body = await request.body()
+
+    # 3. Verify HMAC signature
+    signature = request.headers.get("Linear-Signature", "")
+    if not verify_hmac(body, signature, settings.linear_webhook_secret):
+        log.warning("HMAC verification failed")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # 4. Parse payload
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # 5. Route event (background, HTTP 200 fast)
+    handler: AgentWebhookHandler = request.app.state.handler
+    status = await handler.handle_event(payload)
+    log.info("Event handled: %s", status)
+
+    return Response(
+        content=json.dumps({"status": status}),
+        media_type="application/json",
+        status_code=200,
+    )
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    """Entry point."""
+    import uvicorn
+    uvicorn.run(
+        "linear_agent:app",
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info",
+    )
+
+
+if __name__ == "__main__":
+    main()
