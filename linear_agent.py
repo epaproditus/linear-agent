@@ -1188,8 +1188,6 @@ class TaskProcessor:
         # Hermes is an agentic harness with real tools (filesystem, etc.) behind an
         # OpenAI-compatible endpoint. We do NOT pre-empt it with keyword matching —
         # we hand it the task + context and let it use its tools to actually do it.
-        is_delegation = (session.action == SessionAction.created and not session.body.strip())
-
         if session.action == SessionAction.prompted:
             # Follow-up turn — continue the work/conversation in this thread
             prompt = f"""You are Hermes, an autonomous agent working on Linear issue {identifier} — {title}.
@@ -1205,8 +1203,8 @@ Labels: {', '.join(labels) or 'none'}
 User: {user_request}
 
 Respond to the new message. If it asks you to do something, do it now with your tools and report the result. If it's casual conversation, just reply naturally. Do not repeat your previous messages."""
-        elif not is_delegation:
-            # User explicitly @mentioned with a message
+        else:
+            # User @mentioned Hermes or delegated an issue — do the task
             prompt = f"""You are Hermes, an autonomous agent working inside Linear.
 You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
 
@@ -1216,27 +1214,12 @@ Issue: {identifier} — {title} | Status: {state.get('name', 'Unknown')}
 Project: {project_name or '(none)'}
 Team: {team_name}{f' ({team_key})' if team_key else ''}
 Labels: {', '.join(labels) or 'none'}
-Description: {description or '(none)'}
+Description: {description or '(no description)'}
 {conversation_text}
 
 User's message: {user_request}
 
-Do what the user asked. If it requires real work (reading files, running commands), use your tools and report what you actually did and found. If it's casual, just reply naturally. Be concise. Do not introduce yourself or list capabilities."""
-        else:
-            # Issue delegated to Hermes — the title + description IS the task
-            prompt = f"""You are Hermes, an autonomous agent working inside Linear.
-You have tools available (filesystem, shell, etc.). Use them to actually complete this task.
-
-Your LINEAR_API_KEY for GraphQL API calls to api.linear.app is available as the environment variable $LINEAR_API_KEY — accessible via 'echo $LINEAR_API_KEY' in your shell tools if you need it.
-
-Issue: {identifier} — {title}
-Project: {project_name or '(none)'}
-Team: {team_name}{f' ({team_key})' if team_key else ''}
-Labels: {', '.join(labels) or 'none'}
-Description: {description or '(no description)'}
-{conversation_text}
-
-Start working on this task NOW using your tools. Do the actual work — don't just describe what you would do, and don't ask for confirmation. When finished, report concisely what you did and the result."""
+Do what needs to be done. Use your tools and report what you actually did and found. If it's casual or needs discussion, just reply naturally. Do not ask for confirmation before starting. Be concise. Do not introduce yourself or list capabilities."""
 
         # Emit ephemeral thought so Linear doesn't mark session unresponsive while LLM runs
         await self.linear.create_activity(
@@ -1263,8 +1246,8 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
 
         if response_text:
             await self.linear.send_response(session_id, response_text)
-            # A delegated task is now complete — move to "In Review" for the user
-            if is_delegation and session.action != SessionAction.prompted:
+            # Task complete — move to "In Review" for the user
+            if session.action != SessionAction.prompted:
                 team_id_local = issue.get("team", {}).get("id", session.team_id)
                 issue_id_local = issue.get("id", "")
                 if team_id_local and issue_id_local:
