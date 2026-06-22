@@ -1188,7 +1188,7 @@ class TaskProcessor:
         # Hermes is an agentic harness with real tools (filesystem, etc.) behind an
         # OpenAI-compatible endpoint. We do NOT pre-empt it with keyword matching —
         # we hand it the task + context and let it use its tools to actually do it.
-        is_delegation = not (session.body and session.body != description)
+        is_delegation = (session.action == SessionAction.created and not session.body.strip())
 
         if session.action == SessionAction.prompted:
             # Follow-up turn — continue the work/conversation in this thread
