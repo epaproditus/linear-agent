@@ -1195,7 +1195,7 @@ class TaskProcessor:
             prompt = f"""You are Hermes, an autonomous agent working on Linear issue {identifier} — {title}.
 You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
 
-Your LINEAR_API_KEY for GraphQL API calls to api.linear.app: {settings.linear_api_key}
+Your LINEAR_API_KEY for GraphQL API calls to api.linear.app is available as the environment variable $LINEAR_API_KEY — accessible via 'echo $LINEAR_API_KEY' in your shell tools if you need it.
 
 Issue: {identifier} — {title}
 Project: {project_name or '(none)'}
@@ -1210,7 +1210,7 @@ Respond to the new message. If it asks you to do something, do it now with your 
             prompt = f"""You are Hermes, an autonomous agent working inside Linear.
 You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
 
-Your LINEAR_API_KEY for GraphQL API calls to api.linear.app: {settings.linear_api_key}
+Your LINEAR_API_KEY for GraphQL API calls to api.linear.app is available as the environment variable $LINEAR_API_KEY — accessible via 'echo $LINEAR_API_KEY' in your shell tools if you need it.
 
 Issue: {identifier} — {title} | Status: {state.get('name', 'Unknown')}
 Project: {project_name or '(none)'}
@@ -1227,7 +1227,7 @@ Do what the user asked. If it requires real work (reading files, running command
             prompt = f"""You are Hermes, an autonomous agent working inside Linear.
 You have tools available (filesystem, shell, etc.). Use them to actually complete this task.
 
-Your LINEAR_API_KEY for GraphQL API calls to api.linear.app: {settings.linear_api_key}
+Your LINEAR_API_KEY for GraphQL API calls to api.linear.app is available as the environment variable $LINEAR_API_KEY — accessible via 'echo $LINEAR_API_KEY' in your shell tools if you need it.
 
 Issue: {identifier} — {title}
 Project: {project_name or '(none)'}
