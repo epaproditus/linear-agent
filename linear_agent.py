@@ -1162,7 +1162,7 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
             return None
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=600.0) as client:
                 resp = await client.post(
                     f"{settings.hermes_api_url}/chat/completions",
                     headers={
@@ -1188,7 +1188,7 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
                 return content.strip() if content else None
 
         except httpx.TimeoutException:
-            log.warning("Hermes API call timed out after 120s")
+            log.warning("Hermes API call timed out after 600s")
             return None
         except Exception as e:
             log.warning("Hermes API call failed: %s", e)
