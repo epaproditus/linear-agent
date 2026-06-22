@@ -18,7 +18,7 @@ Linear Webhook POST → HMAC verify → IP allowlist → Event router
     → Emit response activity with result
     → Update issue (comment, status, assignee)
 
-Port: 8646  (next after Plane agent on 8650)
+Port: 8660
 """
 
 from __future__ import annotations
@@ -116,7 +116,14 @@ class Settings(BaseSettings):
 
     @property
     def allowed_team_ids(self) -> set[str]:
-        return {t.strip() for t in self.linear_team_ids.split(",") if t.strip()}
+        """Team IDs from LINEAR_TEAM_IDS and/or ALLOWED_TEAM_IDS."""
+        ids: set[str] = set()
+        for raw in (self.linear_team_ids, self.allowed_team_ids_str):
+            for tid in raw.split(","):
+                tid = tid.strip()
+                if tid:
+                    ids.add(tid)
+        return ids
 
     @property
     def allowed_ips_set(self) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
