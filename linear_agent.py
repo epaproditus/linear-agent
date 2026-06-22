@@ -64,7 +64,7 @@ LINEAR_IPS = frozenset({
 })
 WEBHOOK_TIMEOUT_S = 5      # Must HTTP 200 within 5s
 ACTIVITY_TIMEOUT_S = 10    # Must emit first activity within 10s
-KEEPALIVE_INTERVAL_S = 45  # Emit keepalive activity every 45s during LLM processing
+KEEPALIVE_INTERVAL_S = 15  # Emit keepalive activity every 15s during LLM processing (was 45s)
 PORT = 8660
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -1253,7 +1253,7 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
 
         try:
             # Call LLM for reasoning
-            response_text = await self._call_llm(prompt)
+            response_text = await self._call_llm(prompt, session_id)
         finally:
             keepalive_task.cancel()
             try:
@@ -1279,9 +1279,9 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
                 f"Could not generate a response. Status: {state.get('name', 'Unknown')}",
             )
 
-    async def _call_llm(self, prompt: str) -> str | None:
-        """Call Hermes API server for reasoning. Returns the response text or None on failure.
-
+    async def _call_llm(self, prompt: str, session_id: str = "") -> str | None:
+        """Call Hermes API server for reasoning with streaming support.
+        Streams thinking tokens as thought activities when session_id is provided.
         Retries once (5s backoff) on timeout or 5xx responses.
         Logs response length and elapsed time on every successful 200 response.
         """
@@ -1289,11 +1289,15 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
             log.warning("HERMES_API_KEY not set — cannot call LLM")
             return None
 
+        last_thought_time = 0.0
+
         for attempt in range(2):
             start = time.monotonic()
             try:
+                accumulated = ""
                 async with httpx.AsyncClient(timeout=600.0) as client:
-                    resp = await client.post(
+                    async with client.stream(
+                        "POST",
                         f"{settings.hermes_api_url}/chat/completions",
                         headers={
                             "Authorization": f"Bearer {settings.hermes_api_key}",
@@ -1305,33 +1309,92 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
                                 {"role": "user", "content": prompt}
                             ],
                             "temperature": 0.7,
-                            "max_tokens": 2000,
+                            "max_tokens": 1000,
+                            "stream": True,
                         },
+                    ) as resp:
+                        if resp.status_code != 200:
+                            elapsed = time.monotonic() - start
+                            log.warning(
+                                "Hermes API returned %d (attempt %d/2)",
+                                resp.status_code, attempt + 1,
+                            )
+                            if attempt == 0 and resp.status_code >= 500:
+                                await asyncio.sleep(5)
+                                continue
+                            return None
+
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[6:].strip()
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+
+                            choices = chunk.get("choices", [])
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta", {})
+
+                            # Detect tool calls → emit action activity
+                            tool_calls = delta.get("tool_calls")
+                            if tool_calls and session_id:
+                                for tc in tool_calls:
+                                    fn = tc.get("function", {})
+                                    fn_name = fn.get("name", "")
+                                    fn_args = fn.get("arguments", "")
+                                    if fn_name:
+                                        await self.linear.create_activity(
+                                            session_id,
+                                            ActivityType.action,
+                                            body=f"🛠️ **{fn_name}**",
+                                            action_label=fn_name,
+                                            action_param=fn_args[:100],
+                                            ephemeral=True,
+                                        )
+                                        log.info("Stream: tool call %s", fn_name)
+                                        last_thought_time = time.monotonic()
+
+                            # Accumulate content
+                            content = delta.get("content", "")
+                            if content:
+                                accumulated += content
+
+                            # Emit periodic thought during long streams
+                            now = time.monotonic()
+                            if session_id and content and now - last_thought_time > 10:
+                                snippet = content[-60:].strip()
+                                if snippet:
+                                    display = f"💭 ...{snippet}"
+                                    await self.linear.create_activity(
+                                        session_id,
+                                        ActivityType.thought,
+                                        body=display,
+                                        ephemeral=True,
+                                    )
+                                    last_thought_time = now
+
+                elapsed = time.monotonic() - start
+                result = accumulated.strip() if accumulated else None
+                log.info(
+                    "Hermes API call succeeded: response_len=%d elapsed=%.2fs (attempt %d/2)",
+                    len(result or ""), elapsed, attempt + 1,
+                )
+
+                # Emit a final thinking indicator if streaming was happening
+                if session_id and elapsed > 5:
+                    await self.linear.create_activity(
+                        session_id,
+                        ActivityType.thought,
+                        body="✅ Processing complete — generating response...",
+                        ephemeral=True,
                     )
 
-                    elapsed = time.monotonic() - start
-
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        result = content.strip() if content else None
-                        log.info(
-                            "Hermes API call succeeded: status=%d response_len=%d elapsed=%.2fs (attempt %d/2)",
-                            resp.status_code, len(result or ""), elapsed, attempt + 1,
-                        )
-                        return result
-
-                    log.warning(
-                        "Hermes API returned %d (attempt %d/2): %s",
-                        resp.status_code, attempt + 1, resp.text[:200],
-                    )
-
-                    # Retry on 5xx; fail immediately on 4xx
-                    if attempt == 0 and resp.status_code >= 500:
-                        log.info("Retrying in 5s...")
-                        await asyncio.sleep(5)
-                        continue
-                    return None
+                return result
 
             except httpx.TimeoutException:
                 elapsed = time.monotonic() - start
