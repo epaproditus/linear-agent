@@ -227,6 +227,20 @@ query Me {
 }
 """
 
+GQL_PROJECTS = """
+query Projects {
+  projects {
+    nodes {
+      id
+      name
+      description
+      url
+      teams { nodes { id name key } }
+    }
+  }
+}
+"""
+
 GQL_PROJECT_CREATE = """
 mutation ProjectCreate($input: ProjectCreateInput!) {
   projectCreate(input: $input) {
@@ -418,6 +432,31 @@ class LinearClient:
         """List all teams visible to the agent."""
         data = await self._gql(GQL_TEAMS)
         return data.get("teams", {}).get("nodes", [])
+
+    async def list_projects(self) -> list[dict[str, Any]]:
+        """List all projects visible to the agent."""
+        data = await self._gql(GQL_PROJECTS)
+        return data.get("projects", {}).get("nodes", [])
+
+    async def find_project_by_name(
+        self, name: str, exact: bool = False
+    ) -> dict[str, Any] | None:
+        """Find a project by name (case-insensitive). Returns the first match or None.
+
+        Args:
+            name: Project name to search for.
+            exact: If True, requires exact match (case-insensitive).
+                   If False (default), matches if the search term is contained in the name.
+        """
+        projects = await self.list_projects()
+        name_lower = name.lower()
+        for p in projects:
+            p_name = p.get("name", "").lower()
+            if exact and p_name == name_lower:
+                return p
+            if not exact and name_lower in p_name:
+                return p
+        return None
 
     async def create_project(
         self,
@@ -1337,13 +1376,21 @@ class AgentWebhookHandler:
         self._dedup_cache[key] = now
         return False
 
-    def _is_self_comment(self, payload: dict[str, Any]) -> bool:
-        """Check if the webhook event was triggered by the agent itself."""
+    async def _is_self_comment(self, payload: dict[str, Any]) -> bool:
+        """Check if the webhook event was triggered by the agent itself.
+
+        Compares the event's actor/user ID against the agent's own viewer ID
+        to prevent self-looping. Previously this returned True for ANY non-empty
+        actorId/appUserId, which classified all human comments as self-comments.
+        """
         try:
-            # If the webhook body has a userId that matches the agent
-            user_id = payload.get("notification", {}).get("actorId", "")
-            creator_id = payload.get("appUserId", "")
-            return bool(user_id) or bool(creator_id)
+            actor_id = payload.get("notification", {}).get("actorId", "")
+            app_user_id = payload.get("appUserId", "")
+            user_id = actor_id or app_user_id
+            if not user_id:
+                return False
+            viewer_id = await self.processor.ensure_viewer_id()
+            return user_id == viewer_id
         except Exception:
             return False
 
@@ -1381,7 +1428,7 @@ class AgentWebhookHandler:
 
         # ── Comment Events (for @mentions that may not trigger agent sessions) ──
         if event_type == "Comment" and action == "create":
-            if self._is_self_comment(payload):
+            if await self._is_self_comment(payload):
                 log.info("Skipping own comment — self-loop prevention")
                 return "skipped (self-comment)"
             return await self._handle_comment(payload)
