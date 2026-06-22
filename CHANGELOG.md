@@ -1,5 +1,85 @@
 # Changelog
 
+## 2026-06-22 — EPA-38: Full session activity reconstruction for thread context
+
+**Option A — replaced in-memory `_last_responses` cache with Linear GraphQL session activity reconstruction.**
+
+All changes in `linear_agent.py`.
+
+### What changed
+
+- **Removed** `TaskProcessor._last_responses` — fragile in-memory dict (session_id → last response) that was lost on restart and only captured one prior turn
+- **Removed** 200-char truncation of prior response in prompt context
+- **Added** `_format_activities_conversation()` — reconstructs full chronological conversation from all Linear session activities (prompt → thought → action → response → error), with role labels and timestamps
+- **Replaced** in `_handle_analysis`: `prompted` (follow-up) events now call `get_session_activities()` via the existing `GQL_SESSION_ACTIVITIES` query (previously defined but never wired) instead of the in-memory cache
+- **Preserved** issue-comments fallback when session activities are empty
+
+### Why
+
+The old approach was unreliable after restarts and only provided one turn of context. The new approach uses Linear's immutable activity log to reconstruct the full thread, surviving restarts and supporting multi-turn conversations.
+
+### Verification
+
+- Python syntax validated
+- Zero dangling references to `_last_responses`
+- All prompt templates preserved (prompted, @-mention, delegation)
+- Service restart required: `systemctl --user restart linear-agent`
+
+---
+
+## 2026-06-21 — Project Summary
+
+**Comprehensive project overview documented in `PROJECT_SUMMARY.md`.**
+
+### Project Identity
+
+**Name:** Hermes  
+**Type:** Autonomous Linear Agent Service  
+**Role:** Receives Linear issues via Agent Session API, reasons about them via a local LLM, and delegates coding tasks to Claude Code.
+
+### Architecture (high-level)
+
+```
+Linear (user @mentions or delegates)
+  → POST /linear/webhook
+  → Hermes (FastAPI, port 8660)
+    → HMAC verify → Acknowledge (10s SLA)
+    → Fetch issue via Linear GraphQL
+    → Route: Analysis → LLM API (port 8642)
+             Coding → Claude Code CLI
+    → Emit activities (thought → action → response)
+    → Update issue
+```
+
+### Key Facts
+
+| Metric | Value |
+|--------|-------|
+| Codebase | 1,587 lines (single-file) |
+| Dependencies | 5 Python packages |
+| Endpoints | 2 (health, webhook) |
+| GraphQL ops | 13 queries/mutations |
+| Service port | 8660 (internal) |
+| LLM API port | 8642 (internal) |
+| Compliance | Linear Agent Session API P0/P1/P2 |
+| Security | HMAC-SHA256, timestamp replay protection, self-loop prevention, dedup cache |
+
+### Current State
+
+Deployed and running via systemd. Fully compliant with Linear's Agent Session API spec. Single-file monolith with 5 Python deps. No external cloud dependencies.
+
+### Next Priorities
+
+1. Multi-session concurrency at scale
+2. Structured output / function calling
+3. Integration tests against Linear sandbox
+4. Modular extraction from single file
+5. Monitoring and alerting
+
+---
+
+
+
 ## 2026-06-21 — GraphQL Type Fix
 
 **`GQL_TEAM_STATES` variable type**

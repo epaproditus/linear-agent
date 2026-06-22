@@ -841,6 +841,55 @@ def parse_prompt_context(xml_str: str) -> dict[str, Any]:
     return result
 
 
+def _format_activities_conversation(activities: list[dict[str, Any]]) -> str:
+    """Reconstruct a structured conversation from session activities.
+
+    Sorts by updatedAt and formats prompt/response/action/thought/error activities
+    into a readable conversation string for LLM context.
+    Returns empty string if no meaningful conversation can be reconstructed.
+    """
+    sorted_acts = sorted(activities, key=lambda a: a.get("updatedAt", ""))
+    lines: list[str] = []
+    for act in sorted_acts:
+        content = act.get("content", {})
+        typename = content.get("__typename", "")
+        ts = act.get("updatedAt", "")
+        time_str = ts[11:19] if len(ts) > 19 else ""
+
+        if typename == "AgentActivityPromptContent":
+            body = (content.get("body") or "").strip()
+            if body:
+                lines.append(f"[{time_str}] **User:** {body}")
+
+        elif typename == "AgentActivityResponseContent":
+            body = (content.get("body") or "").strip()
+            if body:
+                if len(body) > 500:
+                    body = body[:500].rstrip() + "…"
+                lines.append(f"[{time_str}] **Hermes:** {body}")
+
+        elif typename == "AgentActivityErrorContent":
+            body = (content.get("body") or "").strip()
+            if body:
+                lines.append(f"[{time_str}] **Hermes (error):** {body[:200]}")
+
+        elif typename == "AgentActivityActionContent":
+            action = content.get("action", "")
+            param = content.get("parameter", "")
+            if action:
+                label = f"**Hermes action: {action}**"
+                if param:
+                    label += f" — {param}"
+                lines.append(f"[{time_str}] {label}")
+
+        elif typename == "AgentActivityThoughtContent":
+            body = (content.get("body") or "").strip()
+            if body and len(body) < 200:
+                lines.append(f"[{time_str}] *Hermes thought:* {body}")
+
+    return "\n".join(lines)
+
+
 # ── Task Processor ──────────────────────────────────────────────────────
 
 
@@ -855,7 +904,6 @@ class TaskProcessor:
         self.linear = linear
         self.coding = coding
         self._viewer_id: str | None = None
-        self._last_responses: dict[str, str] = {}  # session_id → last Hermes response
 
     async def ensure_viewer_id(self) -> str:
         if self._viewer_id is None:
@@ -1010,38 +1058,24 @@ class TaskProcessor:
         priority = issue.get("priority", 0)
         priority_map = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
 
-        # For prompted (follow-up) events, reconstruct the prior exchange from:
-        #   - the original @mention that started this session
-        #   - our cached last response for this session
-        # Do NOT use the full issue comment history — it contains unrelated threads
-        # from previous sessions which confuse the LLM about what was just asked.
+        # Reconstruct prior conversation from session activities.
+        # This survives restarts and preserves the full thread, not just the last response.
         conversation_text = ""
         if session.action == SessionAction.prompted:
-            prior_exchange = ""
-            if session.original_body:
-                prior_exchange += f"User: {session.original_body}\n"
-            last_response = self._last_responses.get(session_id, "")
-            if not last_response:
-                # Cache cold (e.g. after restart) — look for the agent's most recent
-                # comment in the issue as a best-effort fallback
+            activities = await self.linear.get_session_activities(session_id)
+            if activities:
+                conversation_text = _format_activities_conversation(activities)
+            # Fallback: issue comments if activities are empty
+            if not conversation_text:
                 issue_comments = [c for c in
                                   (issue.get("comments", {}).get("nodes", []) or [])
                                   if c is not None]
-                viewer_id = await self.ensure_viewer_id()
-                for c in reversed(issue_comments):
-                    if (c.get("user") or {}).get("id") == viewer_id:
-                        last_response = c.get("body", "")
-                        break
-            if last_response:
-                # Truncate to 200 chars to avoid Hermes mirroring a long prior response
-                summary = last_response[:200].rstrip()
-                if len(last_response) > 200:
-                    summary += "…"
-                prior_exchange += f"Hermes: {summary}\n"
-            if prior_exchange:
-                conversation_text = (
-                    f"Prior exchange:\n{prior_exchange}"
-                )
+                if issue_comments:
+                    conversation_text = "\n\nRecent comments:\n"
+                    for c in issue_comments[-5:]:
+                        author = (c.get("user") or {}).get("name", "Unknown")
+                        body = c.get("body", "")[:300]
+                        conversation_text += f"- {author}: {body}\n"
         else:
             issue_comments = [c for c in
                               (issue.get("comments", {}).get("nodes", []) or [])
@@ -1107,11 +1141,6 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
 
         if response_text:
             await self.linear.send_response(session_id, response_text)
-            # Cache for follow-up context; cap at 200 sessions to avoid unbounded growth
-            self._last_responses[session_id] = response_text
-            if len(self._last_responses) > 200:
-                oldest = next(iter(self._last_responses))
-                del self._last_responses[oldest]
             # A delegated task is now complete — move to "In Review" for the user
             if is_delegation and session.action != SessionAction.prompted:
                 team_id_local = issue.get("team", {}).get("id", session.team_id)
