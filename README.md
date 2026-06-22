@@ -54,6 +54,46 @@ Linear Webhook ──POST──► FastAPI (port 8660)
 3. **Comment (create)**: Direct @mention in an issue comment. Creates a proactive agent session, then processes normally
 4. **Issue (update)**: Assignment or delegation to the agent. Creates agent session and begins work
 
+## Subagent Integration (PLY-35)
+
+When the agent detects a **coding task**, it delegates to a subagent (Claude Code or Codex CLI) instead of using LLM reasoning. Detection is based on issue labels, title keywords, and description keywords.
+
+### Detection Heuristics
+
+| Trigger | Example | Routes to |
+|---------|---------|-----------|
+| Label is Bug/Feature/Enhancement/Development | `Bug` label | CodingBridge |
+| 2+ coding keywords in title+description | "Implement login API" | CodingBridge |
+| 1 coding keyword in title | "Fix bug" | CodingBridge |
+| CODING_AGENT=none | — | Always LLM |
+| No matches | "Write documentation" | Always LLM |
+
+### Delegation Flow
+
+1. **Child issue created** — A linked sub-issue `[Subagent] <title>` is created in Linear to track the subagent's work
+2. **Context assembled** — Issue title, description, labels, and the user's message are bundled as custom instructions
+3. **Subagent spawned** — The coding CLI runs with the full task context
+4. **Result posted** — Output is added as a comment on the parent issue
+5. **Review-before-merge** — Parent issue moves to "In Review" state automatically
+6. **Child issue updated** — Sub-issue reflects the completion or failure status
+
+### Subagent Types
+
+| Backend | CLI Command | Install |
+|---------|-------------|---------|
+| `claude` (default) | `claude --print "prompt"` | `npm install -g @anthropic/claude-code` |
+| `codex` | `codex exec "prompt"` | `npm install -g @openai/codex` |
+| `all` | Both (parallel) | Both above |
+
+Set `CODING_AGENT=all` to run both Claude Code and Codex CLI in parallel. Results from both are collected independently and reported.
+
+### Features Implemented
+
+- **Parallel subagent execution** (`CodingBridge.run_parallel`) — Run multiple coding agents simultaneously
+- **Custom subagent instructions** — User's message is passed verbatim as custom instructions to the subagent
+- **Review-before-merge** — Issues auto-transition to "In Review" after subagent completes
+- **Child issue tracking** — Each subagent delegation creates a tracked sub-issue in Linear
+
 ### Activity Types
 
 The agent emits typed activities to the session for transparency:
@@ -123,7 +163,7 @@ Copy `.env.example` to `.env` and set required values:
 | `LINEAR_ENFORCE_IP_ALLOWLIST` | No | Disable behind reverse proxy (default: true) |
 | `HERMES_API_URL` | No | LLM endpoint (default: http://127.0.0.1:8642/v1) |
 | `HERMES_MODEL` | No | Model name (default: hermes-agent) |
-| `CODING_AGENT` | No | Backend: claude, codex, or none (default: claude) |
+| `CODING_AGENT` | No | Backend: claude, codex, all, or none (default: claude) |
 
 ## Security
 

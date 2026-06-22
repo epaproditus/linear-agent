@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     linear_team_ids: str = ""
     """Comma-separated list of team IDs the agent is allowed to act on."""
 
+    allowed_team_ids_str: str = ""
+    """Alias: comma-separated team ID allowlist (also reads ALLOWED_TEAM_IDS)."""
+
     linear_enforce_ip_allowlist: bool = True
     """If true, only accept webhooks from known IPs."""
 
@@ -2070,6 +2073,7 @@ async def health() -> dict[str, Any]:
 
 
 @app.post("/linear/webhook")
+@app.post("/webhook/linear")
 async def linear_webhook(request: Request) -> Response:
     """Receive Linear webhook events (AgentSessionEvent, Comment, Issue)."""
     # 1. Verify IP (optional but recommended)
