@@ -195,6 +195,20 @@ query IssueByIdentifier($id: String!) {
 }
 """
 
+GQL_ISSUE_CREATE = """
+mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
+    issue {
+      id
+      identifier
+      url
+      title
+    }
+  }
+}
+"""
+
 GQL_CREATE_COMMENT = """
 mutation CommentCreate($input: CommentCreateInput!) {
   commentCreate(input: $input) {
@@ -1075,6 +1089,93 @@ class TaskProcessor:
                 f"❌ An error occurred while processing this issue:\n```\n{e}\n```",
             )
 
+    def build_llm_prompt(
+        self,
+        session: AgentSession,
+        issue: dict[str, Any],
+        conversation_text: str,
+        user_request: str,
+    ) -> str:
+        """Assemble the full LLM prompt from session + issue context.
+
+        The prompt consists of:
+        1. System declaration ("You are Hermes...")
+        2. LINEAR_API_KEY usage (referenced as env var, never interpolated directly)
+        3. Issue context: identifier, title, status, project, team, labels, description
+        4. Conversation thread (recent comments, threaded)
+        5. User's message (session.body or description fallback)
+        6. Instruction: "Do what needs to be done"
+
+        See PLY-32 for the full spec.
+        """
+        identifier = issue.get("identifier", session.issue_identifier)
+        title = issue.get("title", session.title)
+        description = issue.get("description", session.description) or ""
+        state = issue.get("state", {})
+        labels = [l["name"] for l in
+                  (issue.get("labels", {}).get("nodes", []) or [])]
+        project = issue.get("project") or {}
+        project_name = project.get("name", "")
+        team = issue.get("team") or {}
+        team_name = team.get("name", "")
+        team_key = team.get("key", "")
+
+        if session.action == SessionAction.prompted:
+            # Follow-up turn — continue the work/conversation in this thread
+            return (
+                f"You are Hermes, an autonomous agent working on Linear"
+                f" issue {identifier} — {title}.\n"
+                f"You have tools available (filesystem, shell, etc.)."
+                f" Use them to actually do what's asked.\n"
+                f"\n"
+                f"Your LINEAR_API_KEY for GraphQL API calls to api.linear.app"
+                f" is available as the environment variable $LINEAR_API_KEY"
+                f" — accessible via 'echo $LINEAR_API_KEY' in your shell"
+                f" tools if you need it.\n"
+                f"\n"
+                f"Issue: {identifier} — {title}\n"
+                f"Project: {project_name or '(none)'}\n"
+                f"Team: {team_name}"
+                f"{f' ({team_key})' if team_key else ''}\n"
+                f"Labels: {', '.join(labels) or 'none'}\n"
+                f"{conversation_text}\n"
+                f"User: {user_request}\n"
+                f"\n"
+                f"Respond to the new message. If it asks you to do something,"
+                f" do it now with your tools and report the result."
+                f" If it's casual conversation, just reply naturally."
+                f" Do not repeat your previous messages."
+            )
+        else:
+            # User @mentioned Hermes or delegated an issue — do the task
+            return (
+                f"You are Hermes, an autonomous agent working inside Linear.\n"
+                f"You have tools available (filesystem, shell, etc.)."
+                f" Use them to actually do what's asked.\n"
+                f"\n"
+                f"Your LINEAR_API_KEY for GraphQL API calls to api.linear.app"
+                f" is available as the environment variable $LINEAR_API_KEY"
+                f" — accessible via 'echo $LINEAR_API_KEY' in your shell"
+                f" tools if you need it.\n"
+                f"\n"
+                f"Issue: {identifier} — {title}"
+                f" | Status: {state.get('name', 'Unknown')}\n"
+                f"Project: {project_name or '(none)'}\n"
+                f"Team: {team_name}"
+                f"{f' ({team_key})' if team_key else ''}\n"
+                f"Labels: {', '.join(labels) or 'none'}\n"
+                f"Description: {description or '(no description)'}\n"
+                f"{conversation_text}\n"
+                f"\n"
+                f"User's message: {user_request}\n"
+                f"\n"
+                f"Do what needs to be done. Use your tools and report what you"
+                f" actually did and found. If it's casual or needs discussion,"
+                f" just reply naturally. Do not ask for confirmation before"
+                f" starting. Be concise. Do not introduce yourself or list"
+                f" capabilities."
+            )
+
     async def _handle_dev_task(
         self,
         session: AgentSession,
@@ -1145,19 +1246,7 @@ class TaskProcessor:
     ) -> None:
         """Non-coding task: use LLM to reason and respond intelligently."""
         identifier = issue.get("identifier", session.issue_identifier)
-        title = issue.get("title", session.title)
         description = issue.get("description", session.description) or ""
-        state = issue.get("state", {})
-        labels = [l["name"] for l in
-                  (issue.get("labels", {}).get("nodes", []) or [])]
-        priority = issue.get("priority", 0)
-        priority_map = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
-
-        project = issue.get("project") or {}
-        project_name = project.get("name", "")
-        team = issue.get("team") or {}
-        team_name = team.get("name", "")
-        team_key = team.get("key", "")
 
         # Reconstruct prior conversation from session activities.
         # This survives restarts and preserves the full thread, not just the last response.
@@ -1185,41 +1274,10 @@ class TaskProcessor:
         # The user's actual request (from the comment that triggered this)
         user_request = session.body or description or f"Respond to issue {identifier}"
 
-        # Hermes is an agentic harness with real tools (filesystem, etc.) behind an
-        # OpenAI-compatible endpoint. We do NOT pre-empt it with keyword matching —
-        # we hand it the task + context and let it use its tools to actually do it.
-        if session.action == SessionAction.prompted:
-            # Follow-up turn — continue the work/conversation in this thread
-            prompt = f"""You are Hermes, an autonomous agent working on Linear issue {identifier} — {title}.
-You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
-
-Your LINEAR_API_KEY for GraphQL API calls to api.linear.app is available as the environment variable $LINEAR_API_KEY — accessible via 'echo $LINEAR_API_KEY' in your shell tools if you need it.
-
-Issue: {identifier} — {title}
-Project: {project_name or '(none)'}
-Team: {team_name}{f' ({team_key})' if team_key else ''}
-Labels: {', '.join(labels) or 'none'}
-{conversation_text}
-User: {user_request}
-
-Respond to the new message. If it asks you to do something, do it now with your tools and report the result. If it's casual conversation, just reply naturally. Do not repeat your previous messages."""
-        else:
-            # User @mentioned Hermes or delegated an issue — do the task
-            prompt = f"""You are Hermes, an autonomous agent working inside Linear.
-You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
-
-Your LINEAR_API_KEY for GraphQL API calls to api.linear.app is available as the environment variable $LINEAR_API_KEY — accessible via 'echo $LINEAR_API_KEY' in your shell tools if you need it.
-
-Issue: {identifier} — {title} | Status: {state.get('name', 'Unknown')}
-Project: {project_name or '(none)'}
-Team: {team_name}{f' ({team_key})' if team_key else ''}
-Labels: {', '.join(labels) or 'none'}
-Description: {description or '(no description)'}
-{conversation_text}
-
-User's message: {user_request}
-
-Do what needs to be done. Use your tools and report what you actually did and found. If it's casual or needs discussion, just reply naturally. Do not ask for confirmation before starting. Be concise. Do not introduce yourself or list capabilities."""
+        # Build the full prompt using the extracted method
+        prompt = self.build_llm_prompt(
+            session, issue, conversation_text, user_request,
+        )
 
         # Emit ephemeral thought so Linear doesn't mark session unresponsive while LLM runs
         await self.linear.create_activity(
@@ -1259,7 +1317,7 @@ Do what needs to be done. Use your tools and report what you actually did and fo
         else:
             await self.linear.send_response(
                 session_id,
-                f"Could not generate a response. Status: {state.get('name', 'Unknown')}",
+                f"Could not generate a response. Status: {issue.get('state', {}).get('name', 'Unknown')}",
             )
 
     async def _call_llm(self, prompt: str, session_id: str = "") -> str | None:

@@ -1,126 +1,157 @@
 # Linear AI Agent
 
-A full-featured Linear agent that receives issues via Linear's Agent Session API,
-processes them autonomously, and optionally delegates coding tasks to Claude Code or Codex CLI.
+Hermes-powered autonomous agent for Linear. Integrates with Linear's Agent Session API so you can @-mention the agent in issues, delegate tasks to it, and have it respond with typed activities.
 
 ## Architecture
 
 ```
-Linear (user @mentions agent or delegates issue)
-  │
-  ▼  POST /linear/webhook (AgentSessionEvent)
-Agent Service (port 8660)
-  │
-  ├── 1. HMAC-SHA256 verify → IP allowlist → Timestamp check
-  ├── 2. Parse promptContext (issue, comments, guidance)
-  ├── 3. Acknowledge with `thought` activity (within 10s)
-  ├── 4. Process task
-  │     ├── Fetch full issue from Linear GraphQL API
-  │     ├── Analyze: title, description, labels, priority
-  │     ├── If coding task → delegate to Claude Code / Codex CLI
-  │     └── If analysis → summarize, comment, update
-  ├── 5. Emit `action` activities for progress
-  ├── 6. Emit `response` activity with result
-  └── 7. Update issue (comment, status, etc.)
+Linear Webhook ──POST──► FastAPI (port 8660)
+                              │
+                     ┌───────┴───────┐
+                     │  HMAC verify   │
+                     │  IP allowlist  │
+                     └───────┬───────┘
+                             │
+                     ┌───────┴───────┐
+                     │  Event Router │
+                     └───────┬───────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         │                   │                   │
+  AgentSessionEvent      Comment            Issue
+  (created/prompted)   (@mention)      (assign/delegate)
+         │                   │                   │
+         └───────────────────┼───────────────────┘
+                             │
+                     ┌───────┴───────┐
+                     │ TaskProcessor  │
+                     │  (asyncio)     │
+                     └───────┬───────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+        Linear GraphQL  Hermes API    CodingBridge
+        (comments,     (LLM reasoning)  (Claude/Codex)
+         updates,
+         activities)
+
 ```
 
-## Setup
+### Components
 
-### 1. Create a Linear OAuth App
+| Component | Description |
+|-----------|-------------|
+| **FastAPI app** (`linear_agent.py`) | Webhook receiver on port 8660. Handles HMAC verification, IP allowlist, event routing |
+| **LinearClient** | Async GraphQL client for Linear API. Issues, comments, workflow states, agent activities |
+| **TaskProcessor** | Orchestrates task execution. Fetches issue details, runs LLM reasoning, emits activities |
+| **CodingBridge** | Optional: delegates coding tasks to Claude Code or Codex CLI |
+| **AgentWebhookHandler** | Routes webhook events. Deduplication, self-loop prevention, team allowlist |
 
-1. Go to [Linear Settings > API > Applications > New](https://linear.app/settings/api/applications/new)
-2. Name your agent (e.g. "Hermes")
-3. Enable **Webhooks** and check ☑ **Agent session events**
-4. Set the webhook URL to `https://your-host:8660/linear/webhook`
-   (or use Cloudflare tunnel: `https://webhooks.epaphrodit.us/linear/webhook`)
-5. Under **Authentication**, use **Client Credentials**:
-   ```bash
-   curl -X POST https://api.linear.app/oauth/token \
-     -H "Content-Type: application/x-www-form-urlencoded" \
-     -d "grant_type=client_credentials&client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&scope=read,write,app:assignable,app:mentionable"
-   ```
-6. Save the returned **access token** and the **webhook signing secret**
+### Event Flow
 
-### 2. Configure
+1. **AgentSessionEvent (created)**: User @-mentions agent or delegates an issue. Agent acknowledges within 10s (via external URL update), fetches issue, runs LLM, emits response activity
+2. **AgentSessionEvent (prompted)**: Follow-up message in an existing agent session. Agent reconstructs conversation from previous activities, runs LLM, responds
+3. **Comment (create)**: Direct @mention in an issue comment. Creates a proactive agent session, then processes normally
+4. **Issue (update)**: Assignment or delegation to the agent. Creates agent session and begins work
 
-```bash
-cd ~/linear-agent
-cp .env.example .env
-# Edit .env:
-#   LINEAR_API_KEY      = the OAuth access token from step 1
-#   LINEAR_WEBHOOK_SECRET = the webhook signing secret
-#   CODING_AGENT        = claude (default) or codex or none
+### Activity Types
+
+The agent emits typed activities to the session for transparency:
+
+- **thought** (ephemeral): Thinking indicator, updates every 10s during LLM processing
+- **action** (ephemeral): Tool calls (e.g. "Searching files...", "Running shell command...")
+- **response** (persistent): Final response with results
+- **error** (persistent): Error message if something fails
+- **elicitation**: Request for clarification or auth (not currently used by default)
+
+## Repository Structure
+
+```
+/home/abe/linear-agent/
+├── linear_agent.py              # Main application (1875 lines)
+├── pyproject.toml               # Project metadata & dependencies
+├── requirements.txt             # Python dependencies (legacy)
+├── .env.example                 # Configuration template
+├── .gitignore
+├── linear-agent-user.service    # systemd user unit
+├── bin/
+│   ├── linear-agent-wrapper.sh  # Wrapper with systemd-notify watchdog
+│   └── update-service.sh        # Install/update systemd unit
+└── reports/                     # Analysis reports
 ```
 
-### 3. Install & Run
+## Deployment
+
+The agent runs as a systemd **user** service — no root required.
 
 ```bash
-# Option A: Manual
-cd ~/linear-agent
+# Install/update the service
+bash ~/linear-agent/bin/update-service.sh
+
+# Or manually:
+cp linear-agent-user.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user restart linear-agent
+
+# Check status
+systemctl --user status linear-agent
+
+# View logs
+journalctl --user -u linear-agent -f
+```
+
+### Port
+
+| Agent | Port |
+|-------|------|
+| Linear Agent | 8660 |
+| Plane Agent | 8648 |
+| Hermes API Server | 8642 |
+
+## Configuration
+
+Copy `.env.example` to `.env` and set required values:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `LINEAR_API_KEY` | Yes | OAuth token for Linear GraphQL API |
+| `LINEAR_WEBHOOK_SECRET` | Yes | HMAC shared secret for webhook verification |
+| `HERMES_API_KEY` | Yes | API key for Hermes LLM backend |
+| `LINEAR_AGENT_BOT_NAME` | No | Bot display name (default: "Hermes") |
+| `LINEAR_AGENT_USER_ID` | No | Auto-detected; set to prevent self-loop |
+| `LINEAR_TEAM_IDS` | No | Comma-separated team allowlist |
+| `LINEAR_ENFORCE_IP_ALLOWLIST` | No | Disable behind reverse proxy (default: true) |
+| `HERMES_API_URL` | No | LLM endpoint (default: http://127.0.0.1:8642/v1) |
+| `HERMES_MODEL` | No | Model name (default: hermes-agent) |
+| `CODING_AGENT` | No | Backend: claude, codex, or none (default: claude) |
+
+## Security
+
+- **HMAC-SHA256**: Every webhook is verified against a shared secret
+- **IP Allowlist**: Only known Linear webhook IPs accepted (optional, disabled behind reverse proxy)
+- **Team Allowlist**: Restrict which teams the agent can act on
+- **Self-loop Prevention**: Agent ignores its own comments and activities
+- **No API keys in prompts**: Environment variables referenced, never interpolated into LLM context
+
+## Development
+
+```bash
+# Create virtual environment
+uv venv .venv
 source .venv/bin/activate
-uvicorn linear_agent:app --host 0.0.0.0 --port 8660
 
-# Option B: systemd service
-sudo cp linear-agent.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now linear-agent
+# Install dependencies
+uv pip install -r requirements.txt
+
+# Run locally
+uvicorn linear_agent:app --host 0.0.0.0 --port 8660 --reload
+
+# Run with wrapper (systemd-notify watchdog)
+bash bin/linear-agent-wrapper.sh
 ```
 
-### 4. Expose via Cloudflare Tunnel
+## Related
 
-Add this to your Cloudflare tunnel config:
-
-```yaml
-- hostname: webhooks.epaphrodit.us
-  service: http://localhost:8660
-  path: /linear/*
-```
-
-### 5. Test It
-
-```bash
-# Health check
-curl http://localhost:8660/health
-
-# @-mention @Hermes in a Linear issue comment
-# Or delegate an issue to the agent
-```
-
-## How It Works
-
-| Trigger | What Happens |
-|---------|-------------|
-| @-mention in Linear comment | Agent session created → agent analyzes the issue → replies with analysis |
-| Issue delegated to agent | Agent session created → agent processes the task → comments result |
-| Issue assigned to agent | Agent session created → agent picks it up → updates status |
-
-## Coding Agent Integration
-
-When the agent detects a development task (bug, feature, refactor), it routes to:
-
-- **Claude Code** (default) — `claude --print "prompt"` with 5-min timeout
-- **Codex CLI** — `codex exec "prompt"` (install with `npm install -g @openai/codex`)
-
-The coding agent receives the issue title, description, and labels as context.
-Results are posted back to the issue as comments.
-
-## File Structure
-
-```
-~/linear-agent/
-├── linear_agent.py       # Main agent service (all-in-one)
-├── requirements.txt      # Python dependencies
-├── .env.example          # Environment variables template
-├── .env                  # Your credentials (gitignored)
-├── linear-agent.service  # systemd unit
-├── setup.sh              # One-command setup
-└── workspace/            # Coding agent working directory
-```
-
-## Key Security Features
-
-- **HMAC-SHA256** signature verification on every webhook
-- **IP allowlist** — only Linear's published IPs can POST webhooks
-- **Timestamp validation** — prevents replay attacks
-- **Self-loop prevention** — won't reply to its own comments
-- **Dedup cache** — prevents duplicate processing
+- [Hermes Agent](https://hermes-agent.nousresearch.com) — The AI agent framework powering this
+- [Linear Agent Session API](https://developers.linear.app/docs/agent/agent-sessions) — Linear's agent integration docs
+- [Plane Agent](https://plane.epaphrodit.us) — Companion project management agent

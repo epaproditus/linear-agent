@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-SERVICE_SRC="/home/abe/linear-agent/linear-agent.user-service"
+SERVICE_SRC="/home/abe/linear-agent/linear-agent-user.service"
 SERVICE_DST="$HOME/.config/systemd/user/linear-agent.service"
 
 mkdir -p "$(dirname "$SERVICE_DST")"

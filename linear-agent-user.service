@@ -6,21 +6,14 @@ Wants=network-online.target
 [Service]
 WorkingDirectory=/home/abe/linear-agent
 EnvironmentFile=/home/abe/linear-agent/.env
-ExecStartPre=/bin/sh -c 'while ss -tlnp sport = :8660 2>/dev/null | grep -q :8660; do sleep 1; done'
-ExecStart=/home/abe/linear-agent/bin/linear-agent-wrapper.sh
+ExecStartPre=/bin/sh -c 'pid=$(ss -tlnp sport = :8660 2>/dev/null | grep -o "pid=[0-9]*" | grep -o "[0-9]*" | head -1) && [ -n "$pid" ] && kill "$pid" 2>/dev/null && echo "killed stale PID $pid on 8660" || true'
+ExecStart=/home/abe/linear-agent/.venv/bin/uvicorn linear_agent:app --host 0.0.0.0 --port 8660 --log-level info
 Restart=always
 RestartSec=15
 TimeoutStopSec=15
 
-# Security hardening (user service compatible)
-NoNewPrivileges=true
 PrivateTmp=true
 ReadWritePaths=/home/abe/linear-agent/workspace
 
-# systemd-notify based health checks (wrapper uses systemd-notify --ready + WATCHDOG=1)
-Type=notify
-WatchdogSec=30
-NotifyAccess=main
-
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
