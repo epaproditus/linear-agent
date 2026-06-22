@@ -91,7 +91,10 @@ class Settings(BaseSettings):
     """Comma-separated list of team IDs the agent is allowed to act on."""
 
     linear_enforce_ip_allowlist: bool = True
-    """If true, only accept webhooks from LINEAR_IPS."""
+    """If true, only accept webhooks from known IPs."""
+
+    allowed_ips: str = ""
+    """Comma-separated custom IP allowlist. Merged with known Linear IPs."""
 
     hermes_api_url: str = "http://127.0.0.1:8642/v1"
     """Hermes API server URL for LLM reasoning."""
@@ -111,6 +114,16 @@ class Settings(BaseSettings):
     @property
     def allowed_team_ids(self) -> set[str]:
         return {t.strip() for t in self.linear_team_ids.split(",") if t.strip()}
+
+    @property
+    def allowed_ips_set(self) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        """Merged set of known Linear IPs + custom ALLOWED_IPS env var."""
+        ips = set(LINEAR_IPS)
+        for ip_str in self.allowed_ips.split(","):
+            ip_str = ip_str.strip()
+            if ip_str:
+                ips.add(ip_str)
+        return {ipaddress.ip_address(i) for i in ips}
 
     @property
     def configured(self) -> bool:
@@ -755,6 +768,42 @@ class CodingBridge:
                 "error": f"Unknown coding backend: {self.backend}",
             }
 
+    async def run_parallel(
+        self,
+        issue_id: str,
+        title: str,
+        description: str,
+        context: str = "",
+    ) -> list[dict[str, Any]]:
+        """Execute coding tasks on all available backends in parallel.
+
+        When backend is 'all', runs both Claude Code and Codex CLI simultaneously.
+        For single-backend config, delegates to run() and returns a single-result list.
+        """
+        if self.backend == "all":
+            backends = ["claude", "codex"]
+        else:
+            return [await self.run(issue_id, title, description, context)]
+
+        async def _run_backend(b: str) -> dict[str, Any]:
+            bridge = CodingBridge(b, str(self.workdir))
+            return await bridge.run(issue_id, title, description, context)
+
+        log.info("Running subagents in parallel: %s", ", ".join(backends))
+        results: list[dict[str, Any]] = []
+        for result in await asyncio.gather(
+            *[_run_backend(b) for b in backends], return_exceptions=True
+        ):
+            if isinstance(result, BaseException):
+                results.append({
+                    "success": False,
+                    "output": "",
+                    "error": f"Parallel subagent error: {result}",
+                })
+            else:
+                results.append(result)
+        return results
+
     async def _run_claude(
         self, workdir: Path, prompt: str
     ) -> dict[str, Any]:
@@ -856,15 +905,13 @@ def verify_hmac(payload: bytes, signature: str, secret: str) -> bool:
 
 
 def verify_ip(request: Request) -> bool:
-    """Check if the request comes from a known Linear IP."""
+    """Check if the request comes from a known Linear IP or custom ALLOWED_IPS."""
     forwarded = request.headers.get("X-Forwarded-For", "")
     ip_str = forwarded.split(",")[0].strip() if forwarded else (
         request.client.host if request.client else ""
     )
     try:
-        return ipaddress.ip_address(ip_str) in {
-            ipaddress.ip_address(i) for i in LINEAR_IPS
-        }
+        return ipaddress.ip_address(ip_str) in settings.allowed_ips_set
     except ValueError:
         return False
 
@@ -1182,48 +1229,165 @@ class TaskProcessor:
                 f" capabilities."
             )
 
+    async def _is_coding_task(self, issue: dict[str, Any]) -> bool:
+        """Determine if the issue requires coding work.
+
+        Uses keyword heuristics on title, description, and labels.
+        Returns False if coding backend is 'none'.
+        """
+        if settings.coding_agent == "none":
+            return False
+
+        title = (issue.get("title") or "").lower()
+        description = (issue.get("description") or "").lower()
+        labels = [l["name"].lower() for l in
+                  (issue.get("labels", {}).get("nodes", []) or [])]
+
+        # Strong signal: explicit coding labels
+        coding_labels = {"bug", "feature", "enhancement", "development",
+                         "coding", "implementation", "chore"}
+
+        # Title/description keywords suggesting development work
+        coding_keywords = [
+            "implement", "feature", "bug", "fix", "refactor", "build",
+            "code", "develop", "add", "create", "write", "function",
+            "method", "class", "api", "endpoint", "route", "migration",
+            "test", "testing", "deploy", "config", "setup", "integration",
+            "cli", "command", "script", "pipeline", "workflow",
+        ]
+
+        text = f"{title} {description}"
+
+        # Check labels first (strongest signal)
+        for label in labels:
+            if label in coding_labels:
+                return True
+
+        # Count keyword matches in title + description
+        matches = sum(1 for kw in coding_keywords if kw in text)
+
+        # Coding task if 2+ keyword matches, or 1 match in title
+        if matches >= 2:
+            return True
+        if matches >= 1 and any(kw in title for kw in coding_keywords):
+            return True
+
+        return False
+
+    async def _create_child_issue(
+        self,
+        team_id: str,
+        parent_id: str,
+        title: str,
+        description: str = "",
+    ) -> dict[str, Any] | None:
+        """Create a child issue in the same team, linked to the parent."""
+        if not team_id or not parent_id:
+            log.warning("Cannot create child issue: missing team_id or parent_id")
+            return None
+        try:
+            data = await self.linear._gql(GQL_ISSUE_CREATE, {
+                "input": {
+                    "teamId": team_id,
+                    "title": title,
+                    "description": description,
+                    "parentId": parent_id,
+                },
+            })
+            result = data.get("issueCreate", {})
+            if result.get("success"):
+                issue_data = result.get("issue", {})
+                log.info("Created child issue: %s", issue_data.get("identifier", ""))
+                return issue_data
+            else:
+                log.warning("Failed to create child issue")
+                return None
+        except Exception as e:
+            log.exception("Error creating child issue: %s", e)
+            return None
+
     async def _handle_dev_task(
         self,
         session: AgentSession,
         issue: dict[str, Any],
         session_id: str,
     ) -> None:
-        """Route to coding agent (Claude Code / Codex)."""
+        """Route to coding agent (Claude Code / Codex).
+
+        Full subagent delegation flow:
+        1. Create child issue to track subagent work
+        2. Include user's message as custom subagent instructions
+        3. Run the coding agent (supports parallel backends)
+        4. Post results as comment on parent issue
+        5. Move parent to In Review (review-before-merge)
+        6. Update child issue status
+        """
         assert self.coding is not None
 
         title = issue.get("title", session.title)
         description = issue.get("description", session.description) or ""
         identifier = issue.get("identifier", session.issue_identifier)
+        team_id = issue.get("team", {}).get("id", session.team_id)
+        issue_id = issue.get("id", "")
+
+        # 1. Create child issue to track subagent work
+        child_issue = await self._create_child_issue(
+            team_id=team_id,
+            parent_id=issue_id,
+            title=f"[Subagent] {title}",
+            description=(
+                f"Automatically created sub-issue for coding agent"
+                f" ({settings.coding_agent}).\n\n"
+                f"Parent: {identifier}\n"
+                f"Description: {description[:500]}"
+            ),
+        )
+
+        child_ref = ""
+        if child_issue:
+            child_ref = child_issue.get("identifier", "")
+            log.info("Created child issue %s for subagent work", child_ref)
 
         await self.linear.send_action(
             session_id,
             "Delegating to coding agent",
             identifier,
             f"🧑‍💻 Spinning up **{settings.coding_agent.title()} Code** to work on "
-            f"**{identifier}**...",
+            f"**{identifier}**...\n"
+            f"{'🔗 Child issue: ' + child_ref if child_ref else ''}",
         )
 
-        # Run the coding agent
+        # 2. Include user's message as custom subagent instructions
+        custom_instructions = session.body or ""
+        context_parts = [f"Issue: {identifier}"]
+        if session.labels:
+            context_parts.append(f"Labels: {', '.join(session.labels)}")
+        if custom_instructions:
+            context_parts.append(f"Custom instructions: {custom_instructions}")
+        context = "\n".join(context_parts)
+
+        # 3. Run the coding agent
         result = await self.coding.run(
-            issue_id=issue["id"],
+            issue_id=issue_id,
             title=title,
             description=description,
-            context=f"Issue: {identifier}\nLabels: {', '.join(session.labels)}",
+            context=context,
         )
 
         if result["success"] and result["output"]:
             output = result["output"]
-            # Truncate if too long (Linear has comment limits)
             if len(output) > 15000:
                 output = output[:15000] + "\n\n*(output truncated)*"
 
-            # Add result as a comment
-            await self.linear.comment(
-                issue["id"],
+            # 4. Post results as comment on parent issue
+            comment_body = (
                 f"✅ **{settings.coding_agent.title()} Code** completed work on "
                 f"**{identifier}**:\n\n```\n{output[:3000]}\n```\n\n"
-                f"*(Full output available in agent session)*",
+                f"*(Full output available in agent session)*"
             )
+            if child_ref:
+                comment_body += f"\n🔗 Review child issue: {child_ref}"
+            await self.linear.comment(issue_id, comment_body)
 
             await self.linear.send_action(
                 session_id,
@@ -1232,10 +1396,24 @@ class TaskProcessor:
                 result=f"```\n{output[:2000]}\n```",
             )
 
+            # 5. Move parent to In Review (review-before-merge)
+            review_id = None
+            if team_id:
+                review_id = await self.linear.find_state_by_type(
+                    team_id, "started", preferred_name="In Review"
+                )
+                if review_id:
+                    await self.linear.update_issue(issue_id, stateId=review_id)
+
+            # 6. Update child issue status
+            if child_issue and review_id:
+                await self.linear.update_issue(child_issue["id"], stateId=review_id)
+
             await self.linear.send_response(
                 session_id,
                 f"✅ **Done!** {settings.coding_agent.title()} Code finished "
-                f"working on **{identifier}**.",
+                f"working on **{identifier}**.\n"
+                f"{'🔗 Review changes in child issue: ' + child_ref if child_ref else ''}",
             )
 
         elif result["error"]:
@@ -1243,6 +1421,11 @@ class TaskProcessor:
                 session_id,
                 f"❌ Coding agent failed for **{identifier}**:\n```\n{result['error']}\n```",
             )
+            if child_issue:
+                await self.linear.comment(
+                    child_issue["id"],
+                    f"❌ Coding agent failed.\n```\n{result['error'][:2000]}\n```",
+                )
 
     async def _handle_analysis(
         self,
