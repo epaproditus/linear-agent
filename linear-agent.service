@@ -5,20 +5,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=abe
-Group=abe
 WorkingDirectory=/home/abe/linear-agent
 EnvironmentFile=/home/abe/linear-agent/.env
+ExecStartPre=/bin/sh -c 'while ss -tlnp sport = :8660 2>/dev/null | grep -q :8660; do sleep 1; done'
 ExecStart=/home/abe/linear-agent/.venv/bin/uvicorn linear_agent:app --host 0.0.0.0 --port 8660 --log-level info
 Restart=always
-RestartSec=5
-TimeoutStopSec=10
+RestartSec=15
+TimeoutStopSec=15
 
-# Security hardening
+# Security hardening (user service compatible)
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
-ProtectHome=read-only
 ReadWritePaths=/home/abe/linear-agent/workspace
 
 [Install]

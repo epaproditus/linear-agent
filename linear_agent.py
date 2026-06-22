@@ -64,6 +64,7 @@ LINEAR_IPS = frozenset({
 })
 WEBHOOK_TIMEOUT_S = 5      # Must HTTP 200 within 5s
 ACTIVITY_TIMEOUT_S = 10    # Must emit first activity within 10s
+KEEPALIVE_INTERVAL_S = 45  # Emit keepalive activity every 45s during LLM processing
 PORT = 8660
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -208,6 +209,14 @@ GQL_TEAM_STATES = """
 query TeamStates($teamId: ID!) {
   workflowStates(filter: { team: { id: { eq: $teamId } } }) {
     nodes { id name type }
+  }
+}
+"""
+
+GQL_TEAMS = """
+query Teams {
+  teams {
+    nodes { id name key description }
   }
 }
 """
@@ -405,6 +414,11 @@ class LinearClient:
         data = await self._gql(GQL_TEAM_STATES, {"teamId": team_id})
         return data.get("workflowStates", {}).get("nodes", [])
 
+    async def list_teams(self) -> list[dict[str, Any]]:
+        """List all teams visible to the agent."""
+        data = await self._gql(GQL_TEAMS)
+        return data.get("teams", {}).get("nodes", [])
+
     async def create_project(
         self,
         name: str,
@@ -518,15 +532,25 @@ class LinearClient:
 
     async def send_response(self, session_id: str, body: str) -> bool:
         """Emit the final 'response' activity."""
-        return await self.create_activity(
+        result = await self.create_activity(
             session_id, ActivityType.response, body=body,
         )
+        log.info(
+            "send_response(%s): success=%s response_len=%d",
+            session_id[:8], result, len(body),
+        )
+        return result
 
     async def send_error(self, session_id: str, body: str) -> bool:
         """Emit an 'error' activity."""
-        return await self.create_activity(
+        result = await self.create_activity(
             session_id, ActivityType.error, body=body,
         )
+        log.warning(
+            "send_error(%s): success=%s error_len=%d",
+            session_id[:8], result, len(body),
+        )
+        return result
 
     async def send_elicitation(self, session_id: str, body: str) -> bool:
         """Ask a clarification question."""
@@ -1056,6 +1080,12 @@ class TaskProcessor:
         priority = issue.get("priority", 0)
         priority_map = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
 
+        project = issue.get("project") or {}
+        project_name = project.get("name", "")
+        team = issue.get("team") or {}
+        team_name = team.get("name", "")
+        team_key = team.get("key", "")
+
         # Reconstruct prior conversation from session activities.
         # This survives restarts and preserves the full thread, not just the last response.
         conversation_text = ""
@@ -1098,6 +1128,12 @@ class TaskProcessor:
             prompt = f"""You are Hermes, an autonomous agent working on Linear issue {identifier} — {title}.
 You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
 
+Your LINEAR_API_KEY for GraphQL API calls to api.linear.app: {settings.linear_api_key}
+
+Issue: {identifier} — {title}
+Project: {project_name or '(none)'}
+Team: {team_name}{f' ({team_key})' if team_key else ''}
+Labels: {', '.join(labels) or 'none'}
 {conversation_text}
 User: {user_request}
 
@@ -1107,7 +1143,12 @@ Respond to the new message. If it asks you to do something, do it now with your 
             prompt = f"""You are Hermes, an autonomous agent working inside Linear.
 You have tools available (filesystem, shell, etc.). Use them to actually do what's asked.
 
+Your LINEAR_API_KEY for GraphQL API calls to api.linear.app: {settings.linear_api_key}
+
 Issue: {identifier} — {title} | Status: {state.get('name', 'Unknown')}
+Project: {project_name or '(none)'}
+Team: {team_name}{f' ({team_key})' if team_key else ''}
+Labels: {', '.join(labels) or 'none'}
 Description: {description or '(none)'}
 {conversation_text}
 
@@ -1119,9 +1160,13 @@ Do what the user asked. If it requires real work (reading files, running command
             prompt = f"""You are Hermes, an autonomous agent working inside Linear.
 You have tools available (filesystem, shell, etc.). Use them to actually complete this task.
 
+Your LINEAR_API_KEY for GraphQL API calls to api.linear.app: {settings.linear_api_key}
+
 Issue: {identifier} — {title}
-Description: {description or '(no description)'}
+Project: {project_name or '(none)'}
+Team: {team_name}{f' ({team_key})' if team_key else ''}
 Labels: {', '.join(labels) or 'none'}
+Description: {description or '(no description)'}
 {conversation_text}
 
 Start working on this task NOW using your tools. Do the actual work — don't just describe what you would do, and don't ask for confirmation. When finished, report concisely what you did and the result."""
@@ -1134,8 +1179,20 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
             ephemeral=True,
         )
 
-        # Call LLM for reasoning
-        response_text = await self._call_llm(prompt)
+        # Start background keepalive to continue sending activity during long LLM calls
+        keepalive_task = asyncio.create_task(
+            self._keep_session_alive(session_id)
+        )
+
+        try:
+            # Call LLM for reasoning
+            response_text = await self._call_llm(prompt)
+        finally:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
 
         if response_text:
             await self.linear.send_response(session_id, response_text)
@@ -1156,43 +1213,100 @@ Start working on this task NOW using your tools. Do the actual work — don't ju
             )
 
     async def _call_llm(self, prompt: str) -> str | None:
-        """Call Hermes API server for reasoning. Returns the response text or None on failure."""
+        """Call Hermes API server for reasoning. Returns the response text or None on failure.
+
+        Retries once (5s backoff) on timeout or 5xx responses.
+        Logs response length and elapsed time on every successful 200 response.
+        """
         if not settings.hermes_api_key:
             log.warning("HERMES_API_KEY not set — cannot call LLM")
             return None
 
-        try:
-            async with httpx.AsyncClient(timeout=600.0) as client:
-                resp = await client.post(
-                    f"{settings.hermes_api_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.hermes_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": settings.hermes_model,
-                        "messages": [
-                            {"role": "user", "content": prompt}
-                        ],
-                        "temperature": 0.7,
-                        "max_tokens": 2000,
-                    },
-                )
+        for attempt in range(2):
+            start = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=600.0) as client:
+                    resp = await client.post(
+                        f"{settings.hermes_api_url}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {settings.hermes_api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": settings.hermes_model,
+                            "messages": [
+                                {"role": "user", "content": prompt}
+                            ],
+                            "temperature": 0.7,
+                            "max_tokens": 2000,
+                        },
+                    )
 
-                if resp.status_code != 200:
-                    log.warning("Hermes API returned %d: %s", resp.status_code, resp.text[:200])
+                    elapsed = time.monotonic() - start
+
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        result = content.strip() if content else None
+                        log.info(
+                            "Hermes API call succeeded: status=%d response_len=%d elapsed=%.2fs (attempt %d/2)",
+                            resp.status_code, len(result or ""), elapsed, attempt + 1,
+                        )
+                        return result
+
+                    log.warning(
+                        "Hermes API returned %d (attempt %d/2): %s",
+                        resp.status_code, attempt + 1, resp.text[:200],
+                    )
+
+                    # Retry on 5xx; fail immediately on 4xx
+                    if attempt == 0 and resp.status_code >= 500:
+                        log.info("Retrying in 5s...")
+                        await asyncio.sleep(5)
+                        continue
                     return None
 
-                data = resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return content.strip() if content else None
+            except httpx.TimeoutException:
+                elapsed = time.monotonic() - start
+                log.warning(
+                    "Hermes API call timed out after %.2fs (attempt %d/2)",
+                    elapsed, attempt + 1,
+                )
+                if attempt == 0:
+                    log.info("Retrying in 5s...")
+                    await asyncio.sleep(5)
+                    continue
+                return None
 
-        except httpx.TimeoutException:
-            log.warning("Hermes API call timed out after 600s")
-            return None
-        except Exception as e:
-            log.warning("Hermes API call failed: %s", e)
-            return None
+            except Exception as e:
+                elapsed = time.monotonic() - start
+                log.warning(
+                    "Hermes API call failed after %.2fs (attempt %d/2): %s",
+                    elapsed, attempt + 1, e,
+                )
+                if attempt == 0:
+                    log.info("Retrying in 5s...")
+                    await asyncio.sleep(5)
+                    continue
+                return None
+
+        return None
+
+    async def _keep_session_alive(self, session_id: str) -> None:
+        """Periodically emit ephemeral thoughts to keep the session alive
+        during long LLM processing."""
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL_S)
+            try:
+                await self.linear.create_activity(
+                    session_id,
+                    ActivityType.thought,
+                    body="Still thinking...",
+                    ephemeral=True,
+                )
+                log.debug("Keepalive thought sent for session %s", session_id)
+            except Exception:
+                log.warning("Keepalive activity failed for session %s", session_id)
 
 
 # ── Webhook Handler ─────────────────────────────────────────────────────
