@@ -1626,6 +1626,14 @@ class AgentWebhookHandler:
             guidance=parsed_context.get("guidance", []),
         )
 
+        # ── Team allowlist check ──
+        if settings.allowed_team_ids and session.team_id not in settings.allowed_team_ids:
+            log.info(
+                "Session %s from team %s not in allowlist — ignoring",
+                session_id[:8], session.team_id,
+            )
+            return "ignored (team not in allowlist)"
+
         # Spawn background processing and track the task for cancellation
         task: asyncio.Task[None] = asyncio.create_task(self._run_session(session))
         self._active_runs[session_id] = task
@@ -1681,6 +1689,15 @@ class AgentWebhookHandler:
                 # Build a basic session
                 issue = await self.linear.get_issue(issue_id)
                 if issue:
+                    # ── Team allowlist check ──
+                    team_id_comment = issue.get("team", {}).get("id", "")
+                    if settings.allowed_team_ids and team_id_comment not in settings.allowed_team_ids:
+                        log.info(
+                            "@mention on issue %s from team %s not in allowlist — ignoring",
+                            issue_id, team_id_comment,
+                        )
+                        return "ignored (team not in allowlist)"
+
                     session = AgentSession(
                         session_id=session_id,
                         issue_id=issue_id,
@@ -1729,6 +1746,15 @@ class AgentWebhookHandler:
             if session_data.get("success"):
                 session_id = session_data["agentSession"]["id"]
                 issue = await self.linear.get_issue(issue_id)
+                # ── Team allowlist check ──
+                if issue:
+                    team_id_update = issue.get("team", {}).get("id", "")
+                    if settings.allowed_team_ids and team_id_update not in settings.allowed_team_ids:
+                        log.info(
+                            "Assignment on issue %s from team %s not in allowlist — ignoring",
+                            issue_id, team_id_update,
+                        )
+                        return "ignored (team not in allowlist)"
                 if issue:
                     session = AgentSession(
                         session_id=session_id,
