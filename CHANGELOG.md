@@ -10,7 +10,8 @@ All changes in `linear_agent.py`.
 
 - **Removed** `TaskProcessor._last_responses` — fragile in-memory dict (session_id → last response) that was lost on restart and only captured one prior turn
 - **Removed** 200-char truncation of prior response in prompt context
-- **Added** `_format_activities_conversation()` — reconstructs full chronological conversation from all Linear session activities (prompt → thought → action → response → error), with role labels and timestamps
+- **Removed** 500-char truncation of response activities in `_format_activities_conversation()` — LLM now receives full response bodies for maximum context
+- **Added** `_format_activities_conversation()` — reconstructs full chronological conversation from all Linear session activities (prompt → thought → action → response → error), with role labels and timestamps; response bodies are included in full (no truncation)
 - **Replaced** in `_handle_analysis`: `prompted` (follow-up) events now call `get_session_activities()` via the existing `GQL_SESSION_ACTIVITIES` query (previously defined but never wired) instead of the in-memory cache
 - **Preserved** issue-comments fallback when session activities are empty
 

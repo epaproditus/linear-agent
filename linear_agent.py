@@ -864,8 +864,6 @@ def _format_activities_conversation(activities: list[dict[str, Any]]) -> str:
         elif typename == "AgentActivityResponseContent":
             body = (content.get("body") or "").strip()
             if body:
-                if len(body) > 500:
-                    body = body[:500].rstrip() + "…"
                 lines.append(f"[{time_str}] **Hermes:** {body}")
 
         elif typename == "AgentActivityErrorContent":
