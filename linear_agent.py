@@ -1133,15 +1133,10 @@ class TaskProcessor:
                 ],
             )
 
-            # 6. Route to the appropriate handler
-            #    Coding tasks go to _handle_dev_task (delegates to subagent)
-            #    Everything else goes to _handle_analysis (LLM reasoning)
-            if self.coding and await self._is_coding_task(issue):
-                log.info("Routing to _handle_dev_task")
-                await self._handle_dev_task(session, issue, session_id)
-            else:
-                log.info("Routing to _handle_analysis")
-                await self._handle_analysis(session, issue, session_id)
+            # 6. Always route to Hermes LLM reasoning — Hermes has filesystem tools,
+            #    terminal access, and everything it needs. Let it decide if coding is needed.
+            log.info("Routing to _handle_analysis")
+            await self._handle_analysis(session, issue, session_id)
 
         except asyncio.CancelledError:
             raise
