@@ -164,6 +164,14 @@ query Issue($id: String!) {
         body
         createdAt
         user { id name }
+        children {
+          nodes {
+            id
+            body
+            createdAt
+            user { id name }
+          }
+        }
       }
     }
   }
@@ -406,11 +414,12 @@ class LinearClient:
         except RuntimeError:
             return None
 
-    async def comment(self, issue_id: str, body: str) -> bool:
-        """Add a comment to an issue."""
-        data = await self._gql(GQL_CREATE_COMMENT, {
-            "input": {"issueId": issue_id, "body": body},
-        })
+    async def comment(self, issue_id: str, body: str, parent_id: str | None = None) -> bool:
+        """Add a comment to an issue, optionally as a threaded reply."""
+        variables: dict[str, Any] = {"input": {"issueId": issue_id, "body": body}}
+        if parent_id:
+            variables["input"]["parentId"] = parent_id  # type: ignore[typeddict-item]
+        data = await self._gql(GQL_CREATE_COMMENT, variables)
         return data.get("commentCreate", {}).get("success", False)
 
     async def update_issue(
@@ -951,6 +960,31 @@ def _format_activities_conversation(activities: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _flatten_comments(nodes: list[dict[str, Any]], indent: int = 0) -> list[tuple[int, dict[str, Any]]]:
+    """Recursively flatten threaded comments into a depth-annotated list.
+
+    Each item is (depth, comment_dict). Top-level comments are depth 0,
+    children are depth 1, grandchildren depth 2, etc.
+    """
+    result: list[tuple[int, dict[str, Any]]] = []
+    for c in nodes:
+        if c is None:
+            continue
+        result.append((indent, c))
+        child_nodes = c.get("children", {}).get("nodes", []) or []
+        if child_nodes:
+            result.extend(_flatten_comments(child_nodes, indent + 1))
+    return result
+
+
+def _format_comment_line(depth: int, c: dict[str, Any]) -> str:
+    """Format a single comment (with depth) into a readable line."""
+    author = (c.get("user") or {}).get("name", "Unknown")
+    body = c.get("body", "")[:300]
+    prefix = "  > " * depth if depth > 0 else "- "
+    return f"{prefix}{author}: {body}"
+
+
 # ── Task Processor ──────────────────────────────────────────────────────
 
 
@@ -1134,25 +1168,19 @@ class TaskProcessor:
                 conversation_text = _format_activities_conversation(activities)
             # Fallback: issue comments if activities are empty
             if not conversation_text:
-                issue_comments = [c for c in
-                                  (issue.get("comments", {}).get("nodes", []) or [])
-                                  if c is not None]
-                if issue_comments:
-                    conversation_text = "\n\nRecent comments:\n"
-                    for c in issue_comments[-5:]:
-                        author = (c.get("user") or {}).get("name", "Unknown")
-                        body = c.get("body", "")[:300]
-                        conversation_text += f"- {author}: {body}\n"
+                raw_nodes = issue.get("comments", {}).get("nodes", []) or []
+                flat = _flatten_comments(raw_nodes)
+                if flat:
+                    conversation_text = "\n\nRecent comments (threaded):\n"
+                    for depth, c in flat[-8:]:
+                        conversation_text += _format_comment_line(depth, c) + "\n"
         else:
-            issue_comments = [c for c in
-                              (issue.get("comments", {}).get("nodes", []) or [])
-                              if c is not None]
-            if issue_comments:
-                conversation_text = "\n\nRecent comments:\n"
-                for c in issue_comments[-5:]:
-                    author = (c.get("user") or {}).get("name", "Unknown")
-                    body = c.get("body", "")[:300]
-                    conversation_text += f"- {author}: {body}\n"
+            raw_nodes = issue.get("comments", {}).get("nodes", []) or []
+            flat = _flatten_comments(raw_nodes)
+            if flat:
+                conversation_text = "\n\nRecent comments (threaded):\n"
+                for depth, c in flat[-8:]:
+                    conversation_text += _format_comment_line(depth, c) + "\n"
 
         # The user's actual request (from the comment that triggered this)
         user_request = session.body or description or f"Respond to issue {identifier}"

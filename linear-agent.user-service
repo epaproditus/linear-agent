@@ -1,0 +1,19 @@
+[Unit]
+Description=Linear AI Agent — Hermes-powered autonomous agent for Linear
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/abe/linear-agent
+EnvironmentFile=/home/abe/linear-agent/.env
+ExecStartPre=/bin/sh -c 'pid=$(ss -tlnp sport = :8660 2>/dev/null | grep -o "pid=[0-9]*" | grep -o "[0-9]*" | head -1) && [ -n "$pid" ] && kill "$pid" 2>/dev/null && echo "killed stale PID $pid on 8660" || true'
+ExecStart=/home/abe/linear-agent/.venv/bin/uvicorn linear_agent:app --host 0.0.0.0 --port 8660 --log-level info
+Restart=always
+RestartSec=15
+TimeoutStopSec=15
+
+PrivateTmp=true
+ReadWritePaths=/home/abe/linear-agent/workspace
+
+[Install]
+WantedBy=default.target
