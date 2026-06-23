@@ -63,11 +63,11 @@ The LLM prompt includes instructions encouraging natural finding output.
 
 When no new content is generated for more than 3 seconds (during pauses
 in LLM streaming), the background keepalive task emits contextual messages
-based on the most recent tool activity:
+based on the most recent tool or analysis activity:
 
-- "Still: Examining issue PLY-41" (after initial examination)
-- "Still: Read linear_agent.py" (after reading a file)
-- "Still working on it..." (fallback when no context set)
+- "Examining issue PLY-41" (after initial examination)
+- "Read linear_agent.py" (after reading a file)
+- "Working on it..." (fallback when no context set)
 
 These are ephemeral — they don't clutter the permanent timeline.
 
