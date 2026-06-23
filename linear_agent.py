@@ -1195,6 +1195,62 @@ class DiscoveryTracker:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+
+class ProgressQueueWorker:
+    """Dedicated background worker that drains a queue of progress text
+    and POSTs each item to Linear via ``tracker.progress()``.
+
+    This decouples the SSE reading loop (which must never block on I/O)
+    from the Linear GraphQL mutation (which takes 200-500ms per call).
+    """
+
+    def __init__(self, tracker: DiscoveryTracker | None) -> None:
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._tracker = tracker
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        """Launch the background worker. Call before the SSE loop."""
+        self._task = asyncio.create_task(self._run())
+
+    async def put(self, text: str) -> None:
+        """Push text to the queue (never blocks, returns instantly)."""
+        await self._queue.put(text)
+
+    async def drain_and_stop(self) -> None:
+        """Wait for all queued items to be processed, then stop the worker."""
+        await self._queue.join()
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def _run(self) -> None:
+        """Internal: consume the queue and pass to tracker.progress()."""
+        try:
+            while True:
+                text = await self._queue.get()
+                if self._tracker:
+                    try:
+                        await self._tracker.progress(text)
+                    except Exception:
+                        log.warning(
+                            "ProgressQueueWorker: progress() failed",
+                            exc_info=True,
+                        )
+                self._queue.task_done()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.error("ProgressQueueWorker: crashed", exc_info=True)
+            # Prevent deadlock: mark all remaining items done so
+            # drain_and_stop() doesn't hang forever.
+            while not self._queue.empty():
+                self._queue.get_nowait()
+                self._queue.task_done()
+
     def keepalive_context(self) -> str:
         """Return the current investigation context for keepalive messages."""
         if self._keepalive_ctx:
@@ -1931,6 +1987,9 @@ class TaskProcessor:
 
         for attempt in range(2):
             start = time.monotonic()
+            progress_worker = ProgressQueueWorker(tracker) if tracker else None
+            if progress_worker:
+                progress_worker.start()
             try:
                 accumulated = ""
                 async with httpx.AsyncClient(timeout=600.0) as client:
@@ -2041,7 +2100,7 @@ class TaskProcessor:
                                             # Natural progress update (cursor-style)
                                             known_findings.add(discovery)
                                             tracker._keepalive_ctx = discovery[:100]
-                                            await tracker.progress(discovery)
+                                            await progress_worker.put(discovery)
                                 tool_calls_map.clear()
                                 last_thought_time = time.monotonic()
 
@@ -2071,7 +2130,7 @@ class TaskProcessor:
                                             block = _strip_markdown(to_emit)
                                             if block:
                                                 _last_emitted_pos += para_end + 2
-                                                await tracker.progress(block[:500])
+                                                await progress_worker.put(block[:500])
                                         # Fallback: un-emitted text is long with no paragraph break
                                         elif len(new_block) >= 300:
                                             for sep in ('. ', '! ', '? '):
@@ -2081,7 +2140,7 @@ class TaskProcessor:
                                                     block = _strip_markdown(to_emit)
                                                     if block:
                                                         _last_emitted_pos += idx + 1
-                                                        await tracker.progress(block[:500])
+                                                        await progress_worker.put(block[:500])
                                                     break
                                             else:
                                                 # Last resort: break at space
@@ -2090,7 +2149,7 @@ class TaskProcessor:
                                                     block = _strip_markdown(new_block[:idx])
                                                     if block:
                                                         _last_emitted_pos += idx
-                                                        await tracker.progress(block[:500])
+                                                        await progress_worker.put(block[:500])
                                     # Update keepalive context (strip markdown for clean keepalive thoughts)
                                     snippet = new_block.strip()[:100]
                                     if snippet:
@@ -2115,7 +2174,7 @@ class TaskProcessor:
                                 if tracker:
                                     ctx = tracker.keepalive_context()
                                     if ctx:
-                                        await tracker.progress(ctx[:200])
+                                        await progress_worker.put(ctx[:200])
                                 last_thought_time = now
 
                         # Final flush: emit remaining un-emitted content after stream ends
@@ -2127,7 +2186,7 @@ class TaskProcessor:
                                     # Bypass rate limiter to ensure final progress goes through
                                     tracker.last_emit = 0.0
                                     _last_emitted_pos = len(accumulated)
-                                    await tracker.progress(block[:500])
+                                    await progress_worker.put(block[:500])
 
                 elapsed = time.monotonic() - start
                 result = accumulated.strip() if accumulated else None
@@ -2145,6 +2204,11 @@ class TaskProcessor:
                         ephemeral=True,
                     )
 
+                # Drain progress queue before returning so all thought
+                # activities are visible in Linear's timeline.
+                if progress_worker:
+                    await progress_worker.drain_and_stop()
+
                 return result
 
             except httpx.TimeoutException:
@@ -2155,8 +2219,13 @@ class TaskProcessor:
                 )
                 if attempt == 0:
                     log.info("Retrying in 5s...")
+                    # Stop current worker before retry (a new one starts next iteration)
+                    if progress_worker:
+                        await progress_worker.drain_and_stop()
                     await asyncio.sleep(5)
                     continue
+                if progress_worker:
+                    await progress_worker.drain_and_stop()
                 return None
 
             except Exception as e:
@@ -2167,10 +2236,16 @@ class TaskProcessor:
                 )
                 if attempt == 0:
                     log.info("Retrying in 5s...")
+                    if progress_worker:
+                        await progress_worker.drain_and_stop()
                     await asyncio.sleep(5)
                     continue
+                if progress_worker:
+                    await progress_worker.drain_and_stop()
                 return None
 
+        if progress_worker:
+            await progress_worker.drain_and_stop()
         return None
 
     async def _keep_session_alive(self, session_id: str, tracker: DiscoveryTracker | None = None) -> None:
