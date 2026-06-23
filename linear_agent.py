@@ -32,6 +32,7 @@ import os
 import re
 import textwrap
 import time
+from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -66,6 +67,11 @@ WEBHOOK_TIMEOUT_S = 5      # Must HTTP 200 within 5s
 ACTIVITY_TIMEOUT_S = 10    # Must emit first activity within 10s
 KEEPALIVE_INTERVAL_S = 15  # Emit keepalive activity every 15s during LLM processing (was 45s)
 PORT = 8660
+
+# ── Rate Limiting ──
+MAX_CONCURRENT_SESSIONS = 10    # Max concurrent LLM session handlers
+RATE_LIMIT_WINDOW_S = 60       # Sliding window duration (seconds)
+RATE_LIMIT_MAX_REQUESTS = 30   # Max webhook requests per window
 
 # ── Config ───────────────────────────────────────────────────────────────
 
@@ -2106,33 +2112,20 @@ class TaskProcessor:
                             # Emit periodic discovery or in-progress during long streams
                             now = time.monotonic()
                             if session_id and content and now - last_thought_time > 3.0:
-                                # Only scan NEW content since last check
                                 new_content = accumulated[_last_checked_len:]
-                                # Try to extract a finding statement first
+                                _last_checked_len = len(accumulated)
+                                # Try to extract a finding statement first (high-signal milestone)
                                 finding = extract_llm_finding(accumulated, known_findings)
                                 if finding and tracker:
                                     await _route_and_emit_finding(finding, tracker, known_findings)
-                                    _last_checked_len = len(accumulated)
-                                elif len(new_content) > 30 and tracker:
-                                    # Emit the first meaningful sentence from new content as in_progress
-                                    sentence = _extract_first_sentence(new_content)
-                                    if sentence:
-                                        await tracker.in_progress(sentence)
-                                        _last_checked_len = len(accumulated)
-                                    else:
-                                        # Fall back to contextual keepalive
-                                        display = tracker.keepalive_context()
-                                        if len(display) < 5:
-                                            display = "Still working on it..."
-                                        await self.linear.create_activity(
-                                            session_id,
-                                            ActivityType.thought,
-                                            body=display,
-                                            ephemeral=True,
-                                        )
+                                elif new_content and tracker:
+                                    # Emit latest content as in-progress discovery — show progress always
+                                    display = new_content.strip()[:200]
+                                    if len(display) >= 5:
+                                        await tracker.in_progress(display)
                                 else:
-                                    # Fall back to contextual thought from tracker
-                                    display = tracker.keepalive_context() if tracker else "Still thinking..."
+                                    # No new content — use keepalive context from background task
+                                    display = tracker.keepalive_context() if tracker else "Still working on it..."
                                     if len(display) < 5:
                                         display = "Still working on it..."
                                     await self.linear.create_activity(
@@ -2205,7 +2198,51 @@ class TaskProcessor:
                 log.warning("Keepalive activity failed for session %s", session_id)
 
 
-# ── Webhook Handler ─────────────────────────────────────────────────────
+# ── Rate Limiter ──────────────────────────────────────────────────────────
+
+
+class SlidingWindowRateLimiter:
+    """Sliding-window rate limiter.
+
+    Tracks request timestamps in a deque and rejects requests that exceed
+    ``max_requests`` within any ``window_s``-second window.
+    """
+
+    def __init__(self, max_requests: int, window_s: float) -> None:
+        self.max_requests = max_requests
+        self.window_s = window_s
+        self._timestamps: deque[float] = deque()
+
+    def allow(self) -> bool:
+        """Check if a request is allowed under the rate limit.
+
+        Returns True and records the timestamp if under the limit.
+        Returns False if the limit is exceeded (caller should return 429).
+        """
+        now = time.time()
+        cutoff = now - self.window_s
+
+        # Prune expired timestamps from the left
+        while self._timestamps and self._timestamps[0] < cutoff:
+            self._timestamps.popleft()
+
+        if len(self._timestamps) >= self.max_requests:
+            return False
+
+        self._timestamps.append(now)
+        return True
+
+    @property
+    def current_count(self) -> int:
+        """Number of requests in the current window."""
+        now = time.time()
+        cutoff = now - self.window_s
+        while self._timestamps and self._timestamps[0] < cutoff:
+            self._timestamps.popleft()
+        return len(self._timestamps)
+
+
+# ── Webhook Handler ──────────────────────────────────────────────────────
 
 
 class AgentWebhookHandler:
@@ -2218,6 +2255,12 @@ class AgentWebhookHandler:
         self.processor = processor
         self._active_runs: dict[str, asyncio.Task[None]] = {}
         self._dedup_cache: dict[str, float] = {}
+        # Rate limiting
+        self._concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
+        self._rate_limiter = SlidingWindowRateLimiter(
+            max_requests=RATE_LIMIT_MAX_REQUESTS,
+            window_s=RATE_LIMIT_WINDOW_S,
+        )
 
     def _check_dedup(self, key: str, ttl: float = 60.0) -> bool:
         """Returns True if this event was recently processed."""
@@ -2407,24 +2450,36 @@ class AgentWebhookHandler:
 
     async def _run_session(self, session: AgentSession) -> None:
         """Background task for an agent session."""
-        try:
-            issue = await self.linear.get_issue(session.issue_id)
-            await self.processor.process(session, issue)
-        except asyncio.CancelledError:
-            log.info("Session %s cancelled via stop signal", session.session_id[:8])
-            raise
-        except Exception as e:
-            log.exception("Session %s crashed", session.session_id)
+        async with self._concurrency_semaphore:
             try:
-                await self.linear.send_error(
-                    session.session_id,
-                    f"❌ Internal error: {e}",
-                )
-            except Exception:
-                log.exception("Failed to send error activity")
-        finally:
-            self._active_runs.pop(session.session_id, None)
-            log.info("Session %s complete", session.session_id[:8])
+                issue = await self.linear.get_issue(session.issue_id)
+                await self.processor.process(session, issue)
+            except asyncio.CancelledError:
+                log.info("Session %s cancelled via stop signal", session.session_id[:8])
+                raise
+            except Exception as e:
+                log.exception("Session %s crashed", session.session_id)
+                try:
+                    await self.linear.send_error(
+                        session.session_id,
+                        f"❌ Internal error: {e}",
+                    )
+                except Exception:
+                    log.exception("Failed to send error activity")
+            finally:
+                self._active_runs.pop(session.session_id, None)
+                log.info("Session %s complete", session.session_id[:8])
+
+    async def _process_with_semaphore(
+        self, session: AgentSession, issue: dict[str, Any] | None
+    ) -> None:
+        """Wrap processor.process in the concurrency semaphore.
+
+        Used by _handle_comment and _handle_issue_update which spawn
+        processing directly without going through _run_session.
+        """
+        async with self._concurrency_semaphore:
+            await self.processor.process(session, issue)
 
     async def _handle_comment(self, payload: dict[str, Any]) -> str:
         """Handle @mentions in comments."""
@@ -2479,7 +2534,7 @@ class AgentWebhookHandler:
                                 (issue.get("labels", {}).get("nodes", []) or [])],
                         comments=issue.get("comments", {}).get("nodes", []),
                     )
-                    asyncio.create_task(self.processor.process(session, issue))
+                    asyncio.create_task(self._process_with_semaphore(session, issue))
                     return f"processing @mention (session={session_id[:8]}...)"
         except Exception as e:
             log.exception("Failed to create agent session for @mention")
@@ -2537,7 +2592,7 @@ class AgentWebhookHandler:
                                 (issue.get("labels", {}).get("nodes", []) or [])],
                         state_type=issue.get("state", {}).get("type", ""),
                     )
-                    asyncio.create_task(self.processor.process(session, issue))
+                    asyncio.create_task(self._process_with_semaphore(session, issue))
                     return f"processing assignment (session={session_id[:8]}...)"
         except Exception as e:
             log.exception("Failed to handle assignment")
@@ -2623,14 +2678,30 @@ async def linear_webhook(request: Request) -> Response:
         log.warning("HMAC verification failed")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
-    # 4. Parse payload
+    # 4. Check rate limit
+    handler: AgentWebhookHandler = request.app.state.handler
+    if not handler._rate_limiter.allow():
+        retry_after = int(RATE_LIMIT_WINDOW_S)
+        log.warning(
+            "Rate limit exceeded (%d/%d) — returning 429",
+            handler._rate_limiter.current_count, RATE_LIMIT_MAX_REQUESTS,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded. Max {RATE_LIMIT_MAX_REQUESTS} requests "
+                f"per {RATE_LIMIT_WINDOW_S}s. Please retry after {retry_after}s."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # 5. Parse payload
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 5. Route event (background, HTTP 200 fast)
-    handler: AgentWebhookHandler = request.app.state.handler
+    # 6. Route event (background, HTTP 200 fast)
     status = await handler.handle_event(payload)
     log.info("Event handled: %s", status)
 
