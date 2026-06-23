@@ -2038,10 +2038,10 @@ class TaskProcessor:
                                 # Stream raw content as it's generated — no keyword scanning,
                                 # no prefixes, no labels. Just show what Hermes is writing.
                                 if new_content and tracker:
-                                    # Use natural first sentence as ephemeral progress
+                                    # Use natural first sentence as persistent progress
                                     sentence = _extract_first_sentence(new_content, min_len=10)
                                     if sentence:
-                                        await tracker.in_progress(sentence[:200])
+                                        await tracker.progress(sentence[:200])
                                     else:
                                         # Update keepalive context so background timer says something relevant
                                         snippet = new_content.strip()[:120].rstrip(",").strip()
