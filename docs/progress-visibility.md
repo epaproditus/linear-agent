@@ -8,23 +8,24 @@ how those updates work and what to expect.
 
 Instead of showing "Thinking..." or "Running read_file..." status messages,
 Hermes emits **progress updates** that tell you what was actually done or
-found. Each activity carries new information, written in natural language.
+found. Each activity carries new information, written in natural language
+with no prefixes, labels, or emojis.
 
 There are three sources of progress updates:
 
 1. **Tool completion summaries** — After each tool call, the agent executes
-   the same tool locally and extracts a meaningful summary of what was
-   found (e.g. "Found 3 matches for 'class DiscoveryTracker'") rather than
+   the same tool locally and extracts a meaningful summary (e.g. "Read
+   linear_agent.py (560 lines): class DiscoveryTracker...") rather than
    showing what tool was called.
 
-2. **LLM finding extraction** — As the LLM generates its response, the agent
-   scans for finding-like statements (sentences starting with "Found:",
-   "Identified:", "Decided:", etc.), strips the prefix, and emits just the
-   finding as natural text.
+2. **LLM streaming sentences** — As the LLM generates its response, the
+   first complete sentence of new content is emitted every 1+ seconds as
+   an ephemeral in-progress update. No keyword scanning, no "Found:" or
+   "Identified:" prefixes — just whatever the LLM is writing.
 
 3. **Processing milestones** — At the start and end of each session, the
-   agent emits a natural progress update ("Examining issue PLY-41",
-   "Processing complete — response generated").
+   agent emits natural text ("Examining issue PLY-41", "Processing complete
+   — response generated").
 
 ## What You'll See (Typical Timeline)
 
@@ -36,44 +37,59 @@ There are three sources of progress updates:
 [+30s] Processing complete — response generated
 ```
 
-Updates appear as persistent entries in the activity timeline, written in
-natural prose without forced prefixes.
+All text is natural prose. No labels, no prefixes, no emojis.
 
-During long LLM calls (>3s), the stream is scanned for genuine findings.
-When the LLM naturally writes something like "Found: the bug is at line 42",
-the "Found:" prefix is stripped and just "the bug is at line 42" appears
-as a progress update.
+## LLM Streaming Progress
 
-## LLM Finding Extraction
+During streaming LLM calls, every 1+ seconds the agent:
 
-During streaming, the agent scans the LLM output every 3 seconds for:
+1. Checks for new content since the last check (using `_last_checked_len`)
+2. Extracts the first complete sentence from the new content
+3. Emits it as an ephemeral in-progress update via `tracker.in_progress()`
 
-1. **Keyword-prefixed findings** — Lines matching Found:, Identified:,
-   Decided:, Created:, Verified:, Root cause:, etc. The keyword is
-   stripped and the finding body is emitted as natural text.
-2. **Natural language fallback** — Sentences starting with "the ", "this ",
-   "it ", "we ", "i " followed by meaningful verbs may also be captured.
-3. **In-progress sentences** — If no keyword finding exists, the first
-   complete sentence from new content is emitted as an ephemeral
-   in-progress indicator (replaced by the next update).
+If no complete sentence is found (mid-sentence fragment), the content is
+saved as keepalive context so the background timer says something relevant.
 
-The LLM prompt includes instructions encouraging natural finding output.
+No keyword scanning, no pattern matching, no prefix stripping. The output
+reads like cursor's progress — whatever the LLM is actually writing, shown
+as it's written.
 
 ## Keepalive Activities
 
-When no new content is generated for more than 3 seconds (during pauses
-in LLM streaming), the background keepalive task emits contextual messages
-based on the most recent tool or analysis activity:
+When no new content is generated for more than 15 seconds (during pauses
+in LLM streaming or between tool calls), the background keepalive task
+emits contextual messages based on the most recent activity:
 
 - "Examining issue PLY-41" (after initial examination)
 - "Read linear_agent.py" (after reading a file)
 - "Working on it..." (fallback when no context set)
 
+No "Still:" prefix. The keepalive returns the context directly, with
+first-letter capitalization for natural reading.
+
 These are ephemeral — they don't clutter the permanent timeline.
+
+## DiscoveryTracker Methods
+
+All methods produce natural text with no kind labels:
+
+| Method | Type | Use |
+|--------|------|-----|
+| `in_progress(description)` | Ephemeral | Ongoing work, replaced by next update |
+| `progress(detail)` | Persistent | Tool results, intermediate findings |
+| `found(detail)` | Persistent | Alias for progress() |
+| `identified(detail)` | Persistent | Alias for progress() |
+| `decided(detail)` | Persistent | Alias for progress() |
+| `created(detail)` | Persistent | Alias for progress() |
+| `verified(detail)` | Persistent | Alias for progress() |
+
+All persistent methods emit the same way: `label=""`, `body=detail` to
+Linear's API. The method names exist for code readability only — the
+output has no category prefix.
 
 ## Rate Limiting
 
-- Progress updates (persistent): minimum 3 seconds apart
+- Progress updates (persistent): minimum 1.5 seconds apart
 - Ephemeral in-progress updates: minimum 0.5 seconds apart
 - Failed emissions are logged and silently dropped — never block work
 
@@ -84,10 +100,10 @@ These are ephemeral — they don't clutter the permanent timeline.
    agent found or accomplished, it's signal.
 
 2. **Natural prose, no forced prefixes.** Progress text reads like a
-   coworker describing what they're doing or found — no stilted "Found:"
-   or "Identified:" on every line.
+   coworker describing what they found — no "Found:", "Identified:", or any
+   category badge on the text.
 
-3. **No emojis in activities.** Clean text-only milestones for readability.
+3. **No emojis in activities.** Clean text-only milestones.
 
 4. **No backward disclosure.** Raw chain-of-thought, failed attempts,
    credentials, and internal prompts remain hidden.
@@ -96,5 +112,5 @@ These are ephemeral — they don't clutter the permanent timeline.
    work. API errors are logged and ignored.
 
 6. **Tool-level summaries, not raw streaming.** Raw LLM text is not dumped
-   into the timeline. Only extracted findings and tool-completion summaries
-   appear as persistent updates.
+   into the timeline. Only extracted sentences and tool-completion summaries
+   appear as updates.
