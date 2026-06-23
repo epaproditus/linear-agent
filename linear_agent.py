@@ -1174,8 +1174,9 @@ class DiscoveryTracker:
     def keepalive_context(self) -> str:
         """Return the current investigation context for keepalive messages."""
         if self._keepalive_ctx:
-            return f"Still: {self._keepalive_ctx}"
-        return "Still working on it..."
+            # Capitalize first letter for natural reading
+            return self._keepalive_ctx[0].upper() + self._keepalive_ctx[1:]
+        return "Working on it..."
 
 
 # ── Tool Result → Discovery Extractors ─────────────────────────
@@ -2149,9 +2150,9 @@ class TaskProcessor:
                                             tracker._keepalive_ctx = snippet[:100]
                                 else:
                                     # No new content — use keepalive context from background task
-                                    display = tracker.keepalive_context() if tracker else "Still working on it..."
+                                    display = tracker.keepalive_context() if tracker else "Working on it..."
                                     if len(display) < 5:
-                                        display = "Still working on it..."
+                                        display = "Working on it..."
                                     await self.linear.create_activity(
                                         session_id,
                                         ActivityType.thought,
@@ -2210,7 +2211,7 @@ class TaskProcessor:
         while True:
             await asyncio.sleep(KEEPALIVE_INTERVAL_S)
             try:
-                ctx = tracker.keepalive_context() if tracker else "Still working on it..."
+                ctx = tracker.keepalive_context() if tracker else "Working on it..."
                 await self.linear.create_activity(
                     session_id,
                     ActivityType.thought,
