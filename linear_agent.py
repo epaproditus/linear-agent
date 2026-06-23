@@ -1051,9 +1051,10 @@ def _flatten_comments(nodes: list[dict[str, Any]], indent: int = 0) -> list[tupl
 def _format_comment_line(depth: int, c: dict[str, Any]) -> str:
     """Format a single comment (with depth) into a readable line."""
     author = (c.get("user") or {}).get("name", "Unknown")
-    body = c.get("body", "")[:300]
+    body = c.get("body", "") or ""
+    ts = c.get("createdAt", "")[11:19] if c.get("createdAt") else ""
     prefix = "  > " * depth if depth > 0 else "- "
-    return f"{prefix}{author}: {body}"
+    return f"[{ts}] {prefix}{author}: {body}"
 
 
 # ── Task Processor ──────────────────────────────────────────────────────
@@ -1153,6 +1154,7 @@ class TaskProcessor:
         issue: dict[str, Any],
         conversation_text: str,
         user_request: str,
+        internal_text: str = "",
     ) -> str:
         """Assemble the full LLM prompt from session + issue context.
 
@@ -1160,9 +1162,10 @@ class TaskProcessor:
         1. System declaration ("You are Hermes...")
         2. LINEAR_API_KEY usage (referenced as env var, never interpolated directly)
         3. Issue context: identifier, title, status, project, team, labels, description
-        4. Conversation thread (recent comments, threaded)
-        5. User's message (session.body or description fallback)
-        6. Instruction: "Do what needs to be done"
+        4. Conversation thread (all comments, chronological, full body — deterministic)
+        5. Prior session activity (tool calls, thoughts — prompted sessions only)
+        6. User's message (session.body or description fallback)
+        7. Instruction: "Do what needs to be done"
 
         See PLY-32 for the full spec.
         """
@@ -1196,6 +1199,7 @@ class TaskProcessor:
                 f"Team: {team_name}"
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
+                f"{internal_text}\n"
                 f"{conversation_text}\n"
                 f"User: {user_request}\n"
                 f"\n"
@@ -1223,6 +1227,7 @@ class TaskProcessor:
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
                 f"Description: {description or '(no description)'}\n"
+                f"{internal_text}\n"
                 f"{conversation_text}\n"
                 f"\n"
                 f"User's message: {user_request}\n"
@@ -1442,35 +1447,36 @@ class TaskProcessor:
         identifier = issue.get("identifier", session.issue_identifier)
         description = issue.get("description", session.description) or ""
 
-        # Reconstruct prior conversation from session activities.
-        # This survives restarts and preserves the full thread, not just the last response.
+        # ── Deterministic conversation reconstruction ──
+        # Always show ALL issue comments chronologically (full body, no truncation).
+        # This is deterministic — survives provider failures, session resets, and
+        # stale activities. The LLM never has to guess what was said earlier.
         conversation_text = ""
+        raw_nodes = issue.get("comments", {}).get("nodes", []) or []
+        flat = _flatten_comments(raw_nodes)
+        if flat:
+            # Sort ALL comments chronologically for a coherent conversation view
+            flat.sort(key=lambda item: item[1].get("createdAt", ""))
+            conversation_text = "\n\nFull conversation (all comments, chronological):\n"
+            for depth, c in flat:
+                conversation_text += _format_comment_line(depth, c) + "\n"
+
+        # For prompted sessions, ALSO include session activities (tool calls,
+        # thoughts, internal reasoning) as supplementary context above the comments.
+        internal_text = ""
         if session.action == SessionAction.prompted:
             activities = await self.linear.get_session_activities(session_id)
             if activities:
-                conversation_text = _format_activities_conversation(activities)
-            # Fallback: issue comments if activities are empty
-            if not conversation_text:
-                raw_nodes = issue.get("comments", {}).get("nodes", []) or []
-                flat = _flatten_comments(raw_nodes)
-                if flat:
-                    conversation_text = "\n\nRecent comments (threaded):\n"
-                    for depth, c in flat[-8:]:
-                        conversation_text += _format_comment_line(depth, c) + "\n"
-        else:
-            raw_nodes = issue.get("comments", {}).get("nodes", []) or []
-            flat = _flatten_comments(raw_nodes)
-            if flat:
-                conversation_text = "\n\nRecent comments (threaded):\n"
-                for depth, c in flat[-8:]:
-                    conversation_text += _format_comment_line(depth, c) + "\n"
+                internal_text = _format_activities_conversation(activities)
+                if internal_text:
+                    internal_text = "\n\nPrior session activity (Hermes internal):\n" + internal_text
 
         # The user's actual request (from the comment that triggered this)
         user_request = session.body or description or f"Respond to issue {identifier}"
 
         # Build the full prompt using the extracted method
         prompt = self.build_llm_prompt(
-            session, issue, conversation_text, user_request,
+            session, issue, conversation_text, user_request, internal_text,
         )
 
         # Emit ephemeral thought so Linear doesn't mark session unresponsive while LLM runs
