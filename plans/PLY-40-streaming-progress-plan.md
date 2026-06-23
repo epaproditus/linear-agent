@@ -1,8 +1,8 @@
 # PLY-40: Plan — Streaming Progress Updates While Hermes Works an Issue
 
-**Status:** Draft for review  
-**Author:** Hermes Agent  
-**Date:** 2026-06-22  
+**Status:** Draft for review
+**Author:** Hermes Agent
+**Date:** 2026-06-22 (rewritten)
 **Issue:** [PLY-40](https://linear.app/epaphroditus/issue/PLY-40)
 
 ---
@@ -12,229 +12,211 @@
 When Hermes works a Linear issue (via @-mention / Agent Session), the user
 currently sees:
 
-- **Acknowledge:** "🤖 Hermes agent here! Processing the issue..."
-- **Thinking...** (ephemeral, appears once at start)
-- **Still thinking...** (repeated every 15s during long LLM calls)
-- **Tool call activities:** Brief action labels like `🛠️ read_file` with
-  truncated arguments
+- **Acknowledge:** A brief "Hermes agent here! Processing the issue..." thought
+- **Tool call activities:** Brief labels like `read_file` with raw arguments
+- **Keepalive:** "Still thinking..." repeated every 15s during LLM calls
 - **Final response:** A single wall of text showing what was done
 
-Compare with other agents that show:
-- Phase labels ("Analyzing issue...", "Researching codebase...",
-  "Drafting response...")
-- Progress milestones ("Found relevant file X", "Identified root cause Y",
-  "Generated fix Z")
-- Live-snippet updates from intermediate results
+Compare with Cursor's agent mode, where the work product itself materializes
+in real time — you see lines of code being read, diffs appearing, terminal
+output scrolling, and search results arriving. The dynamic feeling comes from
+**watching the answer being assembled**, not from watching status badges update.
 
-**The gap:** Hermes feels static. The activity stream updates are too sparse,
-too generic ("Still thinking..." for extended periods), and don't convey the
-*arc* of work — what phase we're in, what tools are running, how far along we
-are.
+**The gap:** Hermes feels static because it announces intent ("Thinking...",
+"read_file") instead of revealing findings ("Found streaming code at line 1523",
+"Identified 3 gaps in current approach"). The activity stream carries no new
+information between the acknowledge and the final response — just noise.
 
-This plan covers only **the agent's activity emission** — what Hermes reports
-to Linear via Agent Session API activities. It does *not* cover token-by-token
-streaming in the CLI/TUI (that already exists via `streaming: true` and
-`tool_progress: all`).
+**This is not a problem of frequency.** Emitting more announcements ("Now in
+researching phase! Still thinking!") would make Hermes more verbose, not more
+dynamic. The fix is to change *what* gets emitted: from forward-looking status
+to backward-looking results.
 
 ---
 
 ## 2. Design Goals
 
-1. **Feel alive** — The activity stream should update every 2-5s with
-   meaningful phase/content progression, never "Still thinking..." for more
-   than 10s straight.
+1. **Each activity carries new information** — Between "Hermes agent here!" and
+   the final response, every emitted activity should tell the user something
+   they didn't know before. A discovery, a decision, a result.
 
-2. **Phase awareness** — User should be able to tell what broad phase Hermes
-   is in (understand → research → implement → review → respond) at a glance.
+2. **The timeline tells a story** — Scrolling back through activities should
+   show the arc of work: issue understood → code located → gaps identified →
+   approach chosen → implementation created → verified.
 
-3. **Milestone visibility** — Key intermediate results should surface
-   (found a file, matched a pattern, validated a change).
+3. **No dead air** — The user should never see a gap longer than 10s without
+   some visible update. When no new finding is ready, show a contextual
+   keepalive that references the current investigation direction.
 
-4. **Privacy** — Raw reasoning, internal prompts, credentials, and
-   half-baked attempts must remain hidden.
+4. **Privacy** — Raw chain-of-thought reasoning, internal prompts, credentials,
+   failed attempts, and subagent internals remain hidden. The user sees
+   curated findings, not the full reasoning trace.
 
-5. **Non-disruptive** — Activity emission must not add latency to the actual
-   work. Fires and forgets via the Linear API with no retry blocking.
+5. **Non-disruptive** — Activity emission must never block or delay the actual
+   work. Fire-and-forget over the Linear API with no retry blocking.
 
-6. **Configurable** — Platforms/teams that prefer fewer updates can opt in
-   to a "quiet" mode.
+6. **Configurable** — A "sparse" mode shows fewer updates for teams that
+   prefer quiet.
 
 ---
 
 ## 2.5 Why Not Raw Streaming? (Technical Feasibility vs Design Tradeoffs)
 
-A natural question: the Hermes API server already streams tokens via SSE — why not just
-pipe raw reasoning directly into Linear activities?
+A natural question: the Hermes API server already streams tokens via SSE — why
+not pipe raw reasoning directly into Linear activities?
 
 ### Raw Streaming IS Technically Feasible
 
-The existing `_call_llm()` method (linear_agent.py lines 1517-1658) already:
+The existing `_call_llm()` method (lines 1523-1665) already:
 1. Uses `stream: True` to get SSE chunks from the Hermes API
-2. Detects tool calls mid-stream and emits `🛠️ tool_name` actions
-3. Emits content snippets as `💭` thoughts every 10s during long generations
+2. Detects tool calls mid-stream and emits action activities
+3. Emits content snippets every 10s during long generations
 
-A "full raw mode" would simply skip all filtering — push every content delta, every
-thinking token, every variant into the activity stream. The Linear API accepts these
-at ~50-100ms per call, so throughput isn't a bottleneck.
+A "full raw mode" would push every content delta, every thinking token, every
+tool variant into the activity stream. The Linear API accepts these at
+~50-100ms per call.
 
 ### Why Raw Streaming Would Be Worse
 
 **1. Linear activities are NOT a real-time streaming channel.**
 
-Each activity is a discrete, persisted object — it creates a database row, triggers
-webhooks, and appears in Linear's UI as a distinct event. The `ephemeral` flag hides
-it from the permanent timeline but does NOT avoid the per-activity API call. Streaming
-200+ activity objects per minute would:
+Each activity is a discrete, persisted object — it creates a database row,
+triggers webhooks, and appears in the UI as a distinct event. The `ephemeral`
+flag hides it from the permanent timeline but does NOT avoid the per-activity
+API call. Streaming 200+ activities per minute would:
 - Inflate the activity timeline with thousands of tiny updates
-- Trigger webhook events for every single one (unnecessary load)
+- Trigger unnecessary webhook events
 - Cause UI flicker as Linear's activity poller refreshes
 
-Compare: 10-30 PhaseTracker updates per session vs 200+ raw updates.
+A result-oriented approach emits 8-20 activities per session. Raw streaming
+would emit 200-500+.
 
-**2. Raw reasoning is mostly noise, not signal.**
+**2. Raw reasoning is mostly noise.**
 
 An LLM generating 500-2000 tokens per step produces internal monologue like:
-```text
+```
 "Hmm, that approach could work but what if we try... no wait, that ignores
-the constraint about X. Let me reconsider. Actually if we look at it from
-angle Y then..."
+the constraint about X. Let me reconsider..."
 ```
 
-Showing this to the user is counterproductive. Every wrong turn, hesitation, and
-rejected idea appears before the final conclusion. The result is less transparency,
-not more — the signal-to-noise ratio is terrible.
+Showing every wrong turn and hesitation is counterproductive. The signal-to-
+noise ratio is terrible.
 
 **3. Security boundary erosion.**
 
-The raw stream carries:
-- Tool call arguments (file paths, code patterns, query strings)
-- Intermediate errors (stack traces, 4xx/5xx responses, retry state)
-- Potentially credentials if the LLM emits them before redaction
-- Internal system prompts and architectural context
-
-The PhaseTracker approach exposes only tool names + truncated arguments — a
-deliberate security boundary that raw streaming would bypass.
+The raw stream carries tool call arguments (file paths, patterns, queries),
+intermediate errors (stack traces, retry state), and potentially credentials.
+The result-oriented approach exposes only curated findings — a deliberate
+security boundary that raw streaming bypasses.
 
 **4. UI fragmentation across platforms.**
 
-| Platform | Current behavior | Raw streaming |
-|----------|-----------------|---------------|
-| Linear UI | Activities as timeline items (not chat) | Would produce hundreds of refresh updates |
-| CLI | `streaming: true` + `tool_progress: all` already works | Already has its own real-time view |
-| Gateway (Telegram/Discord/WhatsApp) | Edits last message | Can't do true streaming — edit API is rate-limited |
-| Agent Session API | Discrete activity events | No websocket/subscription for real-time |
+| Platform | Current behavior | Raw streaming would |
+|----------|-----------------|---------------------|
+| Linear UI | Activities as timeline items | Hundreds of refresh updates, UI jitter |
+| CLI | Already has real-time streaming via `streaming: true` | Redundant |
+| Gateway (Telegram/Discord) | Edits last message | Rate-limited, can't do true streaming |
+| Agent Session API | Discrete activity events | No subscription model for real-time |
 
-A one-size-fits-all raw stream would be wrong for every platform except CLI — and
-CLI already has its own solution.
+### The Real Difference
 
-### Comparison: PhaseTracker vs Raw Streaming
-
-| Concern | PhaseTracker | Raw streaming |
-|---------|-------------|---------------|
-| Update frequency | Every 1.5-5s | Every 200ms |
-| Activity objects per session | 10-30 | 200-500+ |
-| Security boundary | Tool names + truncated args | Full CoT + tool args + errors |
-| Platform fit (Linear UI) | Natural, readable timeline | UI jitter, too much noise |
-| Platform fit (CLI) | Still works | Redundant (CLI already streams) |
-| Platform fit (gateway) | Works (edits are infrequent) | Rate-limit violations |
-| Signal vs noise | Phase headers + milestones | Everything including hesitation |
-| Backward compatible | Additive, no breaking change | Would need opt-in toggle |
-
-### Decision
-
-Stick with the PhaseTracker approach as designed. If a power user genuinely wants
-raw thinking tokens visible in Linear, add a `raw_reasoning: true` config flag that
-pipes thinking-token deltas into thought activities — but document it as experimental
-and not recommended.
+Raw streaming addresses *frequency* but not *content*. Even if you stream every
+token, you're still showing the process, not the findings. The result-oriented
+model addresses the actual problem: making each activity informative on its own.
 
 ---
 
 ## 3. What to Stream
 
-### 3.1 Phase Headers (ephemeral action activities)
+### 3.1 Discovery Activities (non-ephemeral, persist in timeline)
 
-Every issue goes through a sequence of phases. Hermes should emit a phase
-change as an `action` activity with `ephemeral=True` at phase transitions:
-
-| Phase | Action Label | Example Body |
-|-------|-------------|--------------|
-| Starting | `🚀 Starting` | `Picked up PLY-40: Streaming progress updates` |
-| Understanding | `📖 Understanding` | `Reading issue description, comments, and context...` |
-| Researching | `🔍 Researching` | `Searching codebase for relevant files...` |
-| Implementing | `⚡ Implementing` | `Making changes to linear_agent.py...` |
-| Reviewing | `✅ Reviewing` | `Verifying changes are correct and complete...` |
-| Responding | `💬 Responding` | `Drafting response to issue...` |
-
-Phase transitions are driven by Hermes's own planning loop — the agent
-decides what to do next and reports the phase change before starting.
-
-### 3.2 Tool-In-Progress (ephemeral action activities)
-
-When Hermes invokes a tool that takes noticeable time (>1s), emit a
-descriptive action activity:
+After each meaningful step completes, emit a non-ephemeral action that records
+what was discovered or accomplished:
 
 ```
-🛠️ Searching   → query: "streaming progress" in linear_agent.py
-🛠️ Reading     → ~/linear-agent/linear_agent.py (lines 540-639)
-🛠️ Writing     → Streaming progress plan to ~/linear-agent/plans/PLY-40.md
+Hermes agent here! Processing PLY-40...
+Understood: issue PLY-40 needs visible progress during issue work
+Found: streaming infrastructure in linear_agent.py lines 1523-1665
+Identified: 3 gaps — no result-oriented content, raw tool JSON, generic keepalive
+Decided: emit findings instead of announcements; result-oriented model
+Created: implementation plan at ~/linear-agent/plans/PLY-40.md
+Responding with plan summary...
 ```
 
-These are already partially emitted (the current code catches tool calls
-from the LLM stream), but the content is too raw. Instead of truncated JSON
-arguments, derive a human-readable description:
+Each activity reveals a new finding. The timeline tells a story of discovery,
+not a list of commands run. The user watches the answer being assembled piece
+by piece.
 
-- `read_file(path)` → `📖 Reading {short_path}`
-- `search_files(pattern)` → `🔍 Searching for "{pattern}" in {dir}`
-- `write_file(path)` → `✏️ Writing {short_name}`
-- `patch(path)` → `🔧 Editing {short_name}`
-- `web_search(query)` → `🌐 Searching web for "{truncated_query}"`
-- `delegate_task(goal)` → `🤖 Spawning subagent: {truncated_goal}`
-- `terminal(command)` → `💻 Running: {truncated_command}`
+**Guide for what qualifies as a discovery:**
+- **Found:** A piece of information located during investigation
+  - "Found: streaming code spans lines 1523-1665 in linear_agent.py"
+  - "Found: create_activity accepts action_label, action_param, action_result"
+  - "Found: cursor agent shows inline diffs and live terminal output"
+- **Identified:** A gap, pattern, or relationship recognized
+  - "Identified: all current activities are forward-looking (intent, not result)"
+  - "Identified: tool call arguments contain file paths — too sensitive to expose raw"
+- **Decided:** A choice made between alternatives
+  - "Decided: result-oriented model over phase badges — shows progress through findings"
+  - "Decided: fire-and-forget emission, never block on activity delivery"
+- **Created:** An artifact produced
+  - "Created: implementation plan at ~/linear-agent/plans/PLY-40.md"
+  - "Created: PhaseTracker class with rate-limited emission"
+- **Verified:** A validation completed
+  - "Verified: all existing tests pass after changes"
+  - "Verified: rate limit headroom at 2,400 req/h"
 
-### 3.3 Milestone Completions (non-ephemeral)
+### 3.2 In-Progress Activities (ephemeral, replaced by next activity)
 
-When a meaningful milestone is reached, emit a non-ephemeral action activity
-that persists in the activity stream:
+During long-running operations, emit brief ephemeral activities that indicate
+what's being investigated right now:
 
 ```
-✅ Found root cause: stream.py line 142 — missing phase emission
-✅ Created plan document at ~/linear-agent/plans/PLY-40.md
-✅ Changes verified — all tests pass
+Searching for activity emission patterns in linear_agent.py...
 ```
 
-These are not replaced by subsequent actions, so the user sees a trail of
-accomplishments when they look back.
+These are replaced by the next ephemeral activity (or by a discovery activity)
+and do not clutter the permanent timeline. They serve to prevent dead air.
 
-### 3.4 Live Thought Snippets (during long LLM calls)
+Content guidelines:
+- Describe what's being investigated, not what tool is running
+- "Searching for create_activity usage patterns" not "Running search_files"
+- "Reading streaming implementation in _call_llm" not "Reading file"
+- Keep under 100 chars. These are placeholders, not contributions.
 
-The current code emits a thought snippet every 10s when the LLM is
-generating. Keep this but improve the content:
+### 3.3 Contextual Keepalive
 
-- **Current:** `💭 ...{last 60 chars of generated text}`
-- **Proposed:** `💭 Analyzing approach: {meaningful excerpt from what's being generated}`
-  - Before making a decision: `💭 Considering approach: use phase tracking in _handle_analysis...`
-  - After reaching conclusion: `💭 Decided: incremental phase emission via new PhaseTracker class`
-  - Fallback (if no meaningful snippet): `💭 Generating response... (still working)`
+Replace the static "Still thinking..." with a message that references the
+current investigation direction:
 
-### 3.5 Rich Response Activity
+```
+Still investigating activity emission patterns...
+Still reviewing streaming code structure...
+Still analyzing Cursor agent behavior...
+```
 
-The final `response` activity should include visible progress metadata the
-user can scroll back to see:
+The keepalive picks up context from the last discovery or in-progress activity.
+If no context is available, fall back to "Still working on it..." — which is
+at least honest about the lack of context.
 
-```markdown
-## ✅ Done! PLY-40: Streaming progress updates
+### 3.4 Rich Response Activity
+
+The final `response` activity includes a work summary that makes the discovery
+trail visible post-hoc:
+
+```
+## Done: PLY-40 — Streaming Progress Updates
 
 ### What was done
-- Created implementation plan at `~/linear-agent/plans/PLY-40.md`
-- Analyzed current activity emission in `linear_agent.py`
+- Created implementation plan at ~/linear-agent/plans/PLY-40.md
+- Analyzed current activity emission in linear_agent.py
+- Compared against Cursor agent's real-time progress model
 
 ### Work summary
-- **Phases:** Understand → Research → Plan → Review
-- **9 activities emitted** during processing
-- **5 files examined**, **1 plan document created**
+- 5 files examined
+- 3 gaps identified
+- 1 plan document created
+- 12 activities emitted during processing
 ```
-
-This gives post-hoc visibility into the work arc.
 
 ---
 
@@ -242,18 +224,18 @@ This gives post-hoc visibility into the work arc.
 
 | Category | Examples | Why |
 |----------|----------|-----|
-| Raw chain-of-thought | "First I should check if X, but then Y contradicts..." | Too much noise, internal |
-| Failed attempts | "read_file failed: permission denied, retrying..." | User sees only the retry/success |
+| Raw chain-of-thought | "First I should check X, but Y contradicts..." | Too much noise, internal reasoning |
+| Failed attempts | "read_file failed: permission denied, retrying..." | User sees only resolved state |
 | Internal prompts | "You are Hermes, an autonomous agent..." | Security, privacy |
 | Credentials | API keys, tokens, secrets | Security — redacted system-wide |
-| Tool call JSON | `{"path":"/home/abe/..."}` | Raw JSON is unhelpful |
-| Intermediate errors | 404s, connection resets, retries | Just the final resolved state |
-| Subagent internals | Individual subagent tool calls | Summary of what subagent achieved only |
-| Excessive detail | Every line read, every search result | Overwhelming — milestone summaries only |
+| Tool call JSON | `{"path":"/home/abe/..."}` | Raw JSON is noise, not signal |
+| Intermediate errors | 404s, connection resets | Just the final resolved state |
+| Subagent internals | Individual subagent tool calls | Summary of subagent achievement only |
+| Excessive detail | Every line read, every search result | Milestone summaries only |
 
-**Guiding principle:** Stream what a collaborator would tell you in person.
-Not every keystroke, not every hesitation — just what phase you're in, what
-you're working on now, and what you've achieved.
+**Guiding principle:** Each activity must contain information the user didn't
+have before. If an activity only says what the agent is about to do, it's
+noise. If it says what the agent found or accomplished, it's signal.
 
 ---
 
@@ -262,270 +244,263 @@ you're working on now, and what you've achieved.
 ### 5.1 Ideal Scenario (via Linear UI)
 
 ```
-[+30s]  🤖 Hermes agent here! Processing PLY-40...
-[+32s]  🚀 Starting — Picked up PLY-40: Streaming progress updates
-[+34s]  📖 Understanding — Reading issue description and current activity emission code
-[+38s]  🔍 Researching — Searching for activity emission patterns in linear_agent.py
-[+42s]  🛠️ Searching -> "create_activity" in ~/linear-agent/
-[+45s]  ✅ Found: activity system lives in linear_agent.py lines 540-638
-[+48s]  📖 Reading — linear_agent.py (sections: activity emission, keepalive, streaming)
-[+55s]  ✅ Identified: 3 areas to improve — phase headers, tool descriptions, milestone emissions
-[+60s]  ⚡ Implementing — Drafting implementation plan for PLY-40
-[+90s]  💬 Responding — Writing up plan for review
-[+95s]  ✅ Done! Created plan at ~/linear-agent/plans/PLY-40.md
+[+1s]  Hermes agent here! Processing PLY-40...
+[+5s]  Understood: issue PLY-40 needs visible progress during issue work
+[+10s] Found: streaming infrastructure in linear_agent.py lines 1523-1665
+[+15s] Identified: 3 gaps — no result-oriented content, raw tool JSON, generic keepalive
+[+18s] Decided: emit findings instead of announcements; result-oriented model
+[+25s] Still reviewing plan structure...
+[+30s] Created: implementation plan at ~/linear-agent/plans/PLY-40.md
+[+32s] Responding with plan summary...
+[+35s] Done: PLY-40 — plan ready for review (5 files, 3 gaps, 1 plan, 12 activities)
 ```
 
-Every 2-5 seconds there's a visible update. No gap longer than 10s without
-some activity (falling back to a "Still working..." thought if nothing else
-fits).
+Every 2-10 seconds there's a visible update that teaches the user something.
+No gap longer than 10s without activity (falling back to contextual keepalive).
 
 ### 5.2 During Long LLM Calls
 
 ```
-[+60s]  💭 Analyzing: comparing current activity emission with other agent strategies...
-[+75s]  💭 Decided: use PhaseTracker class to manage progress state
-[+90s]  💭 Developing approach: incremental phases with heartbeat fallback...
-[+105s] 💭 Drafting response...
+[+60s] Analyzing: comparing current activity model with other agents...
+[+75s] Decided: result-oriented model fits Linear's activity paradigm
+[+90s] Structuring: organizing findings into plan sections...
+[+105s] Still generating response...
 ```
 
-### 5.3 Quiet Mode (configurable)
+### 5.3 Sparse Mode (configurable)
 
 For teams that prefer fewer updates, a `progress: sparse` mode:
-- Phase headers only (no per-tool updates)
-- Milestones only (no thought snippets)
-- Keepalive every 30s instead of 10s
+- Discovery activities only (no in-progress activities)
+- Keepalive every 30s instead of 15s
+- No thought snippets during LLM calls
 
 ---
 
 ## 6. Technical Approach
 
-### 6.1 PhaseTracker: A Lightweight State Machine
+### 6.1 DiscoveryTracker: Lightweight State Machine
 
-Introduce a `PhaseTracker` class in `linear_agent.py`:
+Introduce a `DiscoveryTracker` class that manages discovery emission and rate
+limiting. Unlike a phase tracker, this class has no concept of "current phase"
+— it just remembers the last emission time and provides helpers for emitting
+different kinds of findings.
 
 ```python
-class PhaseTracker:
-    """Tracks and emits progress phase transitions during issue work."""
+@dataclass
+class DiscoveryTracker:
+    """Tracks and emits discovery activities during issue work.
 
-    PHASES = [
-        ("starting", "🚀 Starting"),
-        ("understanding", "📖 Understanding"),
-        ("researching", "🔍 Researching"),
-        ("implementing", "⚡ Implementing"),
-        ("reviewing", "✅ Reviewing"),
-        ("responding", "💬 Responding"),
-    ]
+    Unlike a phase tracker, this has no concept of phase. It provides
+    helpers for emitting four kinds of findings (found, identified,
+    decided, created) and rate-limits emission to avoid flooding
+    Linear's API.
 
-    def __init__(self, session_id: str, linear_client: LinearClient):
-        self.session_id = session_id
-        self.linear = linear_client
-        self.current_phase = None
-        self.last_emit = 0.0
-        self.milestones: list[str] = []
+    Key invariant: every non-keepalive activity carries information
+    the user didn't have before.
+    """
 
-    async def enter_phase(self, phase: str, description: str = ""):
-        """Transition to a new phase, emit as ephemeral action."""
-        self.current_phase = phase
-        label, icon = self._phase_info(phase)
-        await self.linear.send_action(
-            self.session_id, label, description,
-            ephemeral=True,
-        )
-        self.last_emit = time.monotonic()
+    session_id: str
+    linear: LinearClient
+    last_emit: float = 0.0
+    activity_count: int = 0
+    _keepalive_ctx: str = ""
 
-    async def milestone(self, msg: str):
-        """Emit a persistent milestone."""
-        self.milestones.append(msg)
-        await self.linear.send_action(
-            self.session_id, "✅ " + msg.split(":")[0], msg,
-            ephemeral=False,  # NOT ephemeral — persists in timeline
-        )
-        self.last_emit = time.monotonic()
+    MIN_ACTIVITY_INTERVAL = 1.5  # seconds between activities
+    MILESTONE_INTERVAL = 3.0     # seconds between persistent milestones
 
-    async def emit_activity(self, kind: str, body: str,
-                            ephemeral: bool = True):
-        """General-purpose activity emission."""
-        await self.linear.create_activity(
+    async def found(self, detail: str) -> bool:
+        """Emit a discovery: something located during investigation."""
+        return await self._emit("Found", detail, ephemeral=False)
+
+    async def identified(self, detail: str) -> bool:
+        """Emit a discovery: a gap, pattern, or relationship recognized."""
+        return await self._emit("Identified", detail, ephemeral=False)
+
+    async def decided(self, detail: str) -> bool:
+        """Emit a discovery: a choice made between alternatives."""
+        return await self._emit("Decided", detail, ephemeral=False)
+
+    async def created(self, detail: str) -> bool:
+        """Emit a discovery: an artifact produced."""
+        return await self._emit("Created", detail, ephemeral=False)
+
+    async def verified(self, detail: str) -> bool:
+        """Emit a discovery: a validation completed."""
+        return await self._emit("Verified", detail, ephemeral=False)
+
+    async def in_progress(self, description: str) -> bool:
+        """Emit an ephemeral in-progress indicator."""
+        self._keepalive_ctx = description
+        return await self._emit("", description, ephemeral=True)
+
+    async def _emit(self, kind: str, detail: str, ephemeral: bool) -> bool:
+        """Rate-limited activity emission. Skips if interval hasn't elapsed."""
+        now = time.monotonic()
+        if ephemeral:
+            sel_interval = 0.5  # in-progress activities are cheap
+        else:
+            sel_interval = self.MILESTONE_INTERVAL
+        if now - self.last_emit < sel_interval:
+            return False
+        self.last_emit = now
+        self.activity_count += 1
+
+        body = f"{kind}: {detail}" if kind else detail
+        return await self.linear.send_action(
             self.session_id,
-            ActivityType.action if kind != "thought" else ActivityType.thought,
-            body=body, ephemeral=ephemeral,
+            label=kind or "progress",
+            param=detail[:200],
+            body=body,
+            ephemeral=ephemeral,
         )
-        self.last_emit = time.monotonic()
 
-    async def heartbeat(self, force: bool = False):
-        """Emit keepalive if enough time has passed since last emission."""
-        # No-op: heartbeat is handled by the keepalive task below
-        pass
+    def keepalive_context(self) -> str:
+        """Return the last in-progress description for keepalive."""
+        return self._keepalive_ctx or "Still working on it..."
 ```
 
-### 6.2 Enhanced Keepalive with Progress
+### 6.2 Enhanced Keepalive with Discovery Context
 
-Replace the current `_keep_session_alive()` with a smarter version that
-carries context:
+Replace the current `_keep_session_alive()` with a version that carries
+context from the last in-progress message:
 
 ```python
 async def _keep_session_alive(self, session_id: str,
-                               phase_tracker: PhaseTracker | None = None) -> None:
-    """Periodically emit keepalive activities, incorporating current phase."""
-    messages = [
-        "Still working on it...",
-        "Processing — this is taking a bit longer than expected",
-        "Still here! Running some analysis...",
-        "Working through the details...",
-        "Taking a bit longer — good things take time!",
-        "Still crunching...",
-    ]
-    idx = 0
+                               tracker: DiscoveryTracker | None = None) -> None:
+    """Periodically emit keepalive activities with discovery context."""
     while True:
         await asyncio.sleep(KEEPALIVE_INTERVAL_S)
         try:
-            msg = messages[idx % len(messages)]
-            idx += 1
-            phase = phase_tracker.current_phase if phase_tracker else ""
-            prefix = f"[{phase}] " if phase else ""
+            ctx = tracker.keepalive_context() if tracker else "Still thinking..."
             await self.linear.create_activity(
-                session_id, ActivityType.thought,
-                body=f"{prefix}{msg}", ephemeral=True,
+                session_id,
+                ActivityType.thought,
+                body=ctx,
+                ephemeral=True,
             )
         except Exception:
             pass
 ```
 
-### 6.3 Tool Call Activity Enhancement
+This replaces the rotating list of generic messages ("Still thinking...",
+"Still here! Running some analysis...", etc.) with a single context-aware
+message that references the current investigation direction.
 
-In `_call_llm()`, when a tool call is detected from the stream, translate
-it into a human-readable description:
+### 6.3 Tool Result → Discovery Mapping
 
-```python
-_TOOL_LABELS = {
-    "read_file": ("📖", "Reading"),
-    "write_file": ("✏️", "Writing"),
-    "search_files": ("🔍", "Searching"),
-    "patch": ("🔧", "Editing"),
-    "web_search": ("🌐", "Searching web"),
-    "web_extract": ("📄", "Fetching URL"),
-    "terminal": ("💻", "Running"),
-    "delegate_task": ("🤖", "Delegating"),
-    "execute_code": ("🐍", "Running code"),
-}
-
-def _describe_tool_call(name: str, args: dict) -> str:
-    """Generate a human-readable description of a tool call."""
-    icon, verb = _TOOL_LABELS.get(name, ("🛠️", name))
-    # Key arguments that make good descriptions
-    if name == "search_files":
-        return f"{verb} for \"{args.get('pattern', '')[:60]}\""
-    elif name in ("read_file",):
-        return f"{verb} {args.get('path', '')[:80]}"
-    elif name in ("write_file", "patch"):
-        return f"{verb} {args.get('path', '')[:80]}"
-    elif name == "web_search":
-        return f"{verb} for \"{args.get('query', '')[:80]}\""
-    elif name == "terminal":
-        cmd = args.get("command", "")[:60]
-        return f"{verb}: {cmd}"
-    elif name == "delegate_task":
-        goal = args.get("goal", "")[:80]
-        return f"{verb}: {goal}"
-    else:
-        return f"{verb}({name})"
-```
-
-### 6.3b Tool Result Emission (Cursor-Inspired)
-
-After each tool completes, emit a concise result summary when the output is short and meaningful. This closes the main gap with Cursor's model (Cursor shows tool *results* inline, not just tool *calls*).
+Instead of describing the tool call itself, derive a discovery statement from
+the tool's output. This is the core shift from announcements to results.
 
 ```python
-_TOOL_RESULT_SUMMARIZERS: dict[str, Callable[[Any], str | None]] = {
-    "search_files": lambda r: (
-        f"Found {r['total_count']} matches"
-        if isinstance(r, dict) and r.get("total_count", 0) > 0
+_DISCOVERY_EXTRACTORS: dict[str, Callable[[dict, Any], str | None]] = {
+    "read_file": lambda args, result: (
+        f"Read {args.get('path', '')} ({result.count(chr(10)) + 1} lines)"
+        if isinstance(result, str) and len(result) > 0
         else None
     ),
-    "web_search": lambda r: (
-        f"Found {len(r.get('results', []))} results"
-        if isinstance(r, dict) else None
+    "search_files": lambda args, result: (
+        f"Found {result.get('total_count', 0)} matches for"
+        f" '{args.get('pattern', '')[:40]}' in {args.get('path', '.')}"
+        if isinstance(result, dict) and result.get("total_count", 0) > 0
+        else "No matches found"
+    ),
+    "web_search": lambda args, result: (
+        f"Found {len(result.get('results', []))} web results for"
+        f" '{args.get('query', '')[:50]}'"
+        if isinstance(result, dict) and result.get("results")
+        else "No web results found"
+    ),
+    "web_extract": lambda args, result: (
+        f"Fetched content from {args.get('urls', ['?'])[0][:60]}"
+        f" ({len(result)} chars)"
+        if isinstance(result, str)
+        else None
+    ),
+    "execute_code": lambda args, result: (
+        "Code executed successfully"
+        if isinstance(result, dict) and result.get("status") == "success"
+        else None
     ),
 }
 
-def _summarize_tool_output(name: str, result: Any, args: dict) -> str | None:
-    \"\"\"Return a brief milestone-worthy summary, or None if not meaningful.\"\"\"
-    if name == "search_files":
-        matches = result.get("total_count", 0) if isinstance(result, dict) else 0
-        if matches > 0:
-            pattern = args.get("pattern", "")[:40]
-            return f"Found {matches} match{'es' if matches != 1 else ''} for \"{pattern}\""
-    elif name == "read_file":
-        path = args.get("path", "")
-        lines = result.count("\\n") + 1 if isinstance(result, str) else 0
-        if lines > 0:
-            return f"Read {path} ({lines} lines)"
-    elif name == "web_search":
-        results = result.get("results", []) if isinstance(result, dict) else []
-        if results:
-            return f"Found {len(results)} web results"
-    elif name == "execute_code":
-        status = result.get("status", "")
-        if status == "success":
-            return "Code executed successfully"
-    return None  # No summary worth emitting
+
+def extract_discovery(tool_name: str, args: dict, result: Any) -> str | None:
+    """Return a discovery statement from a completed tool call, or None."""
+    extractor = _DISCOVERY_EXTRACTORS.get(tool_name)
+    if extractor is None:
+        return None
+    try:
+        return extractor(args, result)
+    except Exception:
+        return None
 ```
 
-This runs in the main loop after each tool call completes. If a summary is returned and <200 chars, emit it as a non-ephemeral milestone:
+This runs synchronously after each tool call completes in the main loop:
 
 ```python
-summary = _summarize_tool_output(tool_name, tool_result, tool_args)
-if summary and len(summary) < 200:
-    await tracker.milestone(summary)
+# In the main processing loop:
+discovery = extract_discovery(tool_name, tool_args, tool_result)
+if discovery:
+    await tracker.found(discovery)
 ```
 
-Too-noisy results (large file reads, terminal output, complex data) return `None` naturally via the guard conditions above.
+If no discovery can be derived (tool output too complex, too verbose, or no
+extractor registered), nothing is emitted — the keepalive timer continues
+ticking and the next tool call picks up.
 
-### 6.4 Phase Detection Heuristics
+### 6.4 Deriving Discoveries from LLM Stream
 
-The agent needs to know what phase it's in. This is driven by the tool call
-stream and the phase transition logic in `_handle_analysis()`:
+The most valuable discoveries come not from tool calls but from the LLM's
+streaming output — the actual reasoning about what was found. The current
+code already captures content deltas. The improvement is to replace the
+last-60-chars snippet with extraction of meaningful finding statements.
+
+**Mechanism:** After the LLM completes a thought segment (detected by pauses
+in the stream, sentence boundaries, or newlines followed by decisions), check
+if the accumulated content contains a finding. Finding patterns include:
+
+- "Found:" or "found that" — a discovery
+- "Identified:" — a gap or pattern
+- "Decided:" or "going with" or "approach:" — a decision
+- "Created:" or "wrote" — an artifact
+- "Root cause:" or "the issue is" — a diagnosis
 
 ```python
-# In _handle_analysis, before calling LLM:
-tracker = PhaseTracker(session_id, self.linear)
-await tracker.enter_phase("understanding", f"Reading issue {identifier}")
+_FINDING_PATTERNS = re.compile(
+    r'(Found|Identified|Decided|Created|Root cause|The issue is|Going with)',
+    re.IGNORECASE,
+)
 
-# Then, periodically during LLM processing, the stream parser
-# detects tool calls and infers phase:
-async for chunk in stream:
-    tool = detect_tool_call(chunk)
-    if tool:
-        phase = infer_phase_from_tool(tool.name)
-        if phase and phase != tracker.current_phase:
-            await tracker.enter_phase(phase, tool.description)
+def extract_llm_finding(accumulated: str, known_findings: set[str]) -> str | None:
+    """Check accumulated LLM output for a new finding statement."""
+    lines = accumulated.split("\n")
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or len(stripped) < 15:
+            continue
+        if _FINDING_PATTERNS.search(stripped):
+            # Normalize: trim trailing period, cap length
+            finding = stripped.rstrip(".").strip()[:200]
+            if finding not in known_findings:
+                return finding
+    return None
 ```
 
-Phase inference from tool calls:
-
-| Tool | Inferred Phase |
-|------|---------------|
-| `read_file`, `search_files`, `web_search`, `web_extract` | `researching` |
-| `write_file`, `patch`, `terminal` (build commands) | `implementing` |
-| `terminal` (test commands), `read_file` (verification read) | `reviewing` |
-| `delegate_task` | `implementing` |
-| LLM text generation (no tools for a while) | `responding` |
-
-This uses the *first* tool call in a batch to infer phase — once a phase is
-set, it doesn't change until a tool call from a different category appears.
+This runs every 10s during LLM streaming (same cadence as the current thought
+snippet). If a new finding is extracted, emit it as a discovery activity.
 
 ### 6.5 Activity Rate Limiting
 
-To avoid flooding Linear's API (rate limit: 5,000 req/h per key), enforce
-a minimum interval between activity emissions:
+Same approach as the original plan — enforce minimum intervals to avoid
+flooding Linear's API (5,000 req/h per key):
 
 ```python
-MIN_ACTIVITY_INTERVAL = 1.5  # seconds between any activity
-MILESTONE_INTERVAL = 3.0     # minimum between milestones
+MIN_ACTIVITY_INTERVAL = 1.5   # seconds between any activity
+MILESTONE_INTERVAL = 3.0      # seconds between persistent discoveries
 ```
 
-The `PhaseTracker.emit_activity()` method checks these and skips if the
-interval hasn't elapsed (except for phase transitions, which always fire).
+At 1.5s minimum between activities, the theoretical max is 2,400 req/h —
+well under Linear's 5,000 limit.
 
 ### 6.6 No Changes to Agent Session API
 
@@ -542,8 +517,8 @@ The integration stays 100% within the existing Agent Session API:
 
 | File | Change |
 |------|--------|
-| `~/linear-agent/linear_agent.py` | Add `PhaseTracker` class, enhance `_call_llm` tool descriptions, improve keepalive, add phase inference, add milestone emission |
-| `~/linear-agent/plans/PLY-40.md` | This plan document (keep as reference) |
+| `linear_agent.py` | Add `DiscoveryTracker` class, replace content-tail snippets with finding extraction, enhance keepalive with discovery context, add discovery extraction from tool results |
+| `plans/PLY-40-streaming-progress-plan.md` | This plan document (keep as reference) |
 
 No new files. No config changes. No new dependencies.
 
@@ -553,49 +528,61 @@ No new files. No config changes. No new dependencies.
 
 ### 8.1 Activity Flooding
 
-**Risk:** Too many activity emissions could hit Linear's 5,000 req/h rate
-limit, especially during complex multi-tool tasks.
+**Risk:** Too many discoveries could hit Linear's 5,000 req/h rate limit.
 
-**Mitigation:** Enforce `MIN_ACTIVITY_INTERVAL = 1.5s` — at 2,400 req/h,
-well under the 5,000 limit. Phase transitions are exempt from the interval
-(a single extra activity per phase change is negligible).
+**Mitigation:** Enforce `MIN_ACTIVITY_INTERVAL = 1.5s` — at 2,400 req/h, well
+under the limit. Discovery extractors return `None` for non-informative
+results, keeping volume naturally low. Expected: 8-20 activities per session.
 
 ### 8.2 Activity vs. Real Progress
 
 **Risk:** Emitting activities could add latency if done synchronously.
 
-**Mitigation:** Activity emission is fire-and-forget (the current
-implementation already uses async HTTP without awaiting retries). Phase
-tracker emits are non-blocking — the main work loop never waits for an
-activity to be confirmed.
+**Mitigation:** Activity emission is fire-and-forget (the current implementation
+already uses async HTTP without awaiting retries). Discovery tracker emits are
+non-blocking — the main work loop never waits for confirmation.
 
-### 8.3 Phase Misclassification
+### 8.3 Missing Discoveries
 
-**Risk:** Heuristic phase detection (inferring phase from tool name) could
-misclassify. E.g., `read_file` could be used in any phase.
+**Risk:** The tool result extractors or LLM finding patterns could miss
+meaningful results, making the agent feel silent again.
 
-**Mitigation:** Phase transitions are suggestions, not commands. The agent
-can explicitly call `tracker.enter_phase()` to override. Misclassification
-is a UX issue (wrong icon/phase shown briefly), never a correctness issue.
-Next tool call in a different category corrects it.
+**Mitigation:** This is a non-critical UX issue — the final response still
+contains the full result. The extractor set is extensible (add new tool
+mappings in a dict). The LLM finding extraction runs every 10s as a safety
+net: even if all extractors miss, the LLM's own output may yield a finding.
+If everything misses, the contextual keepalive still fires.
 
-### 8.4 Noise in Activity Timeline
+### 8.4 Discovery Quality
 
-**Risk:** Non-ephemeral milestones could clutter the activity timeline.
+**Risk:** Extracted findings could be meaningless or misleading (e.g., "Found:
+Code executed successfully" for trivial operations).
 
-**Mitigation:** Milestones are intentionally kept to major achievements
-only (file created, root cause found, tests passing). The `_handle_analysis`
-path currently emits 2-4 persistent activities total; with this change,
-expect 4-8 per issue — still very lean.
+**Mitigation:** Extractors have strict guards — only return a discovery when
+the result is meaningful. The `execute_code` extractor only fires on explicit
+success status. The `search_files` extractor only fires on non-zero match
+count. LLM findings are deduplicated by content hash. If quality is still
+an issue, add a minimum length filter (>20 chars) and skip trivial patterns.
 
 ### 8.5 Backward Compatibility
 
 **Risk:** Existing agent sessions in progress when code is deployed.
 
-**Mitigation:** All changes are additive — new activity emissions alongside
-existing ones. No change to activity schema or API calls. Running sessions
-that don't use `PhaseTracker` continue with the old behavior. A restart
-picks up the new code.
+**Mitigation:** All changes are additive — new discovery emissions alongside
+existing activities. No change to activity schema or API calls. Running
+sessions that don't use `DiscoveryTracker` continue with the old behavior.
+A restart picks up the new code.
+
+### 8.6 LLM Finding Extraction Reliability
+
+**Risk:** Regex-based finding extraction from LLM output may produce false
+positives (picking up "I found that..." in a hypothetical discussion, not an
+actual discovery).
+
+**Mitigation:** The extraction only runs on the *accumulated output* — text
+the LLM has already committed to, not stream mid-thought. False positives
+produce minor noise (a discovery that isn't really a discovery), which the
+user can scroll past. The rate limiter prevents explosion.
 
 ---
 
@@ -603,13 +590,13 @@ picks up the new code.
 
 | Condition | Behavior |
 |-----------|----------|
-| Linear API rate-limited (429) | Activity is dropped silently; work continues uninterrupted |
-| Activity creation fails | Logged at DEBUG level; no retry; work continues |
-| Phase tracker not initialized | Falls back to current behavior (keepalive only) |
-| Unknown phase requested | Falls back to "⚙️ Working" (generic phase label) |
-| Network error posting activity | Logged and ignored; work continues |
-| Tool name not in `_TOOL_LABELS` | Falls back to `🛠️ {tool_name}()` with truncated args |
-| Zero activities for >30s | Keepalive fires "Still working..." (unchanged from current) |
+| Linear API rate-limited (429) | Activity dropped silently; work continues |
+| Activity creation fails | Logged at DEBUG; no retry; work continues |
+| Discovery extractor raises exception | Logged; treated as "no discovery"; work continues |
+| LLM finding extraction empty | Nothing emitted; keepalive continues normally |
+| No tool results to extract from | Nothing emitted; next tool call or keepalive fills gap |
+| Keepalive context empty | Falls back to "Still working on it..." |
+| Tracker not initialized | Falls back to current behavior (keepalive only) |
 
 The invariant: **activity emission is always optional.** The core task
 processing (LLM calls, tool execution, response generation) never blocks
@@ -621,9 +608,6 @@ on activity delivery.
 
 ### 10.1 Updated Module Docstring (linear_agent.py)
 
-The existing docstring at the top of `linear_agent.py` should be updated
-to mention the activity emission system:
-
 ```
 Architecture
 ────────────
@@ -631,47 +615,46 @@ Linear Webhook POST → HMAC verify → IP allowlist → Event router
   → Background asyncio Task
     → Acknowledge (thought activity within 10s — required by Linear)
     → Parse promptContext (issue, comments, guidance)
-    → Initialize PhaseTracker (monitors & emits progress)
+    → Initialize DiscoveryTracker (emits findings as they happen)
     → Process task (analyze, research, code)
-      → Emit phase transitions (📖 Understanding → 🔍 Researching → etc.)
-      → Emit tool-in-progress activities for visible tools
-      → Emit milestone activities for key achievements
-      → Background keepalive during long LLM calls
+      → Emit discovery activities (Found, Identified, Decided, Created)
+      → Derive discoveries from completed tool call results
+      → Extract finding statements from LLM output stream
+      → Background keepalive with current investigation context
     → Emit response activity with result + work summary
     → Update issue (comment, status, assignee)
 ```
 
-### 10.2 PhaseTracker Docstring
-
-Add a thorough docstring to `PhaseTracker`:
+### 10.2 DiscoveryTracker Docstring
 
 ```python
-class PhaseTracker:
-    """Emits visible progress updates to Linear Agent Session.
+class DiscoveryTracker:
+    """Emits discovery activities to show progress during issue work.
 
-    Uses Linear's activity system (thought/action/response) to show
-    the user what phase Hermes is in, what tool is running, and what
-    milestones have been achieved — without exposing internal reasoning.
+    Uses Linear's activity system to reveal findings as they happen.
+    Unlike a phase tracker (which announces what the agent is about to
+    do), this emits what the agent has found or accomplished.
+
+    Four discovery kinds are supported:
+    - Found: something located during investigation
+    - Identified: a gap, pattern, or relationship recognized
+    - Decided: a choice made between alternatives
+    - Created: an artifact produced
 
     Key behaviors:
-    - Phase transitions (understanding → researching → etc.) are
-      ephemeral actions replaced by the next phase.
-    - Tool-in-progress activities show what tool is running and on
-      what input, using human-readable descriptions not raw JSON.
-    - Milestones are non-ephemeral actions that persist in the
-      timeline, giving the user a visible trail of accomplishments.
+    - Each non-keepalive activity carries information the user didn't
+      have before.
+    - Tool call results are mined for discoveries via extractors.
+    - LLM streaming output is scanned for finding statements every 10s.
     - All emissions are fire-and-forget — never block the main work.
-    - Rate-limited to MIN_ACTIVITY_INTERVAL between emissions to
-      avoid flooding Linear's API.
+    - Rate-limited to MIN_ACTIVITY_INTERVAL between emissions.
     """
 ```
 
 ### 10.3 Configuration Reference
 
-Add a config section documenting acceptable activity frequency:
-
 ```yaml
-# ~/linear-agent/config.yaml (or .env)
+# ~/linear-agent/.env
 # Activity emission tuning:
 
 # How often the keepalive fires during LLM processing (seconds)
@@ -680,39 +663,42 @@ Add a config section documenting acceptable activity frequency:
 # Minimum interval between activity emissions (seconds)
 # MIN_ACTIVITY_INTERVAL_S=1.5
 
-# Minimum interval between milestone emissions (seconds)
+# Minimum interval between persistent discoveries (seconds)
 # MILESTONE_INTERVAL_S=3.0
 
-# Progress verbosity: "full" (default), "sparse" (phase+milestones only)
+# Progress verbosity: "full" (default), "sparse" (discoveries only, no keepalive context)
 # PROGRESS_VERBOSITY=full
 ```
 
-### 10.4 User-Facing Docs (for README or Linear Doc)
+### 10.4 User-Facing Guide
 
-Create a brief user-facing doc in
-`~/linear-agent/docs/progress-visibility.md`:
+Create `~/linear-agent/docs/progress-visibility.md`:
 
 ```markdown
 # Progress Visibility
 
-When Hermes works your issue, it shows visible progress in the
-Linear activity timeline:
+When Hermes works your issue, it reveals findings as they happen in the
+Linear activity timeline. Instead of seeing raw tool calls and "Still
+thinking..." messages, you see a trail of discoveries:
 
-1. **Phase badges** — See what phase Hermes is in:
-   📖 Understanding → 🔍 Researching → ⚡ Implementing → 💬 Responding
+1. **Found** — Files located, patterns matched, search results
+2. **Identified** — Gaps spotted, root causes recognized
+3. **Decided** — Approaches chosen, alternatives evaluated
+4. **Created** — Plans written, code changed, documents produced
 
-2. **Tool indicators** — Know what command is running:
-   "📖 Reading linear_agent.py" or "🌐 Searching web for..."
+Each activity carries information you didn't have before. Scrolling back
+through the timeline tells the story of how the answer was assembled.
 
-3. **Milestones** — See key achievements:
-   "✅ Root cause found: line 142 missing phase emission"
-
-4. **No internal reasoning** — You see progress, not thinking.
+## What stays hidden
+- Raw chain-of-thought reasoning
+- Failed attempts and retries
+- Credentials and internal prompts
+- Individual tool call JSON
 
 ## Configuration
 
-Set `PROGRESS_VERBOSITY=sparse` in your environment to see only
-phase badges and milestones (no per-tool updates).
+Set `PROGRESS_VERBOSITY=sparse` in the Linear agent environment to see
+only major discoveries (no in-progress indicators or thought snippets).
 ```
 
 ---
@@ -721,15 +707,15 @@ phase badges and milestones (no per-tool updates).
 
 | Step | Description | Estimated Effort |
 |------|-------------|-----------------|
-| 1 | Add `PhaseTracker` class with phase management and rate limiting | 1-2 hours |
-| 2 | Integrate `PhaseTracker` into `_handle_analysis()` — initialize, emit phases | 1 hour |
-| 3 | Enhance tool call descriptions in `_call_llm()` — human-readable labels | 1 hour |
-| 4 | Add phase inference from tool stream | 30 min |
-| 5 | Enhance keepalive with progress context | 30 min |
-| 6 | Add milestone emission in `_handle_analysis()` and `_handle_dev_task()` | 1 hour |
-| 7 | Add fallback label for unknown tools | 15 min |
+| 1 | Add `DiscoveryTracker` class with discovery helper methods and rate limiting | 1-2 hours |
+| 2 | Integrate `DiscoveryTracker` into `_handle_analysis()` — initialize, wire discovery emission at key points | 1 hour |
+| 3 | Add tool result → discovery mapping (`_DISCOVERY_EXTRACTORS` dict) | 1 hour |
+| 4 | Add LLM finding extraction from streaming output (replace content-tail snippets) | 1 hour |
+| 5 | Enhance keepalive with discovery context (replace rotating message list) | 30 min |
+| 6 | Wire discovery emissions in `_handle_analysis()` — emit at investigation boundaries | 30 min |
+| 7 | Add fallback handling for missing/empty discoveries | 15 min |
 | 8 | Test with real issue workflows | 1 hour |
-| 9 | Write documentation | 30 min |
+| 9 | Write documentation (docstring, config, user-facing guide) | 30 min |
 | **Total** | | **~6-8 hours** |
 
 ---
@@ -738,23 +724,28 @@ phase badges and milestones (no per-tool updates).
 
 The implementation is complete when:
 
-1. **Phase transitions visible** — Every issue handling session shows clear
-   phase progression (📖 → 🔍 → ⚡ → 💬) in the Linear activity timeline, with
-   no more than 10s gap between updates during active processing
+1. **Every non-keepalive activity carries new information** — Scrolling the
+   activity timeline shows a trail of findings (Found, Identified, Decided,
+   Created), not tool calls or status badges.
 
-2. **Tool calls readable** — Activities show "📖 Reading file X" instead of
-   "🛠️ read_file" with JSON args
+2. **No gap longer than 10s** without visible activity during active
+   processing. Keepalive includes current investigation context.
 
-3. **Milestones persist** — Key accomplishments (files created, root causes
-   found, changes verified) appear as non-ephemeral activities
+3. **Tool results produce discoveries** — After meaningful tool calls
+   (search_files, read_file, web_search), a discovery activity appears with
+   what was found, not just what tool ran.
 
-4. **Rate safety** — >2,400 req/h headroom on Linear API rate limit
+4. **LLM findings extracted** — During long generation, the 10s thought
+   snippet contains a meaningful finding statement, not the last 60 chars of
+   raw output.
 
-5. **Fallback clean** — API errors during activity emission never crash or
-   delay the actual task processing
+5. **Rate safety** — >2,400 req/h headroom on Linear API rate limit.
 
-6. **No regression** — "Still thinking..." keepalive still fires if no other
-   activity has been emitted within 15s
+6. **Fallback clean** — API errors during activity emission never crash or
+   delay the actual task processing.
+
+7. **No regression** — Contextual keepalive still fires if no discovery has
+   been emitted within 15s.
 
 ---
 
