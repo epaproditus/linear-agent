@@ -1093,6 +1093,7 @@ class DiscoveryTracker:
     last_emit: float = 0.0
     activity_count: int = 0
     _keepalive_ctx: str = ""
+    _pending_tasks: list[asyncio.Task] = field(default_factory=list)
 
     MIN_ACTIVITY_INTERVAL: float = 0.8
     """Minimum seconds between any activity emission."""
@@ -1139,8 +1140,17 @@ class DiscoveryTracker:
     async def _emit(self, kind: str, detail: str, ephemeral: bool) -> bool:
         """Rate-limited activity emission. Skips if interval hasn't elapsed.
 
-        Fire-and-forget: never blocks or retries on failure.
-        Returns True if emitted, False if rate-limited or failed.
+        Uses ``thought`` type activities (not action) because ``action``
+        activities have no ``body`` field in the GraphQL schema — Linear
+        drops it silently.  ``thought`` activities have a ``body`` field
+        that renders with proper word-wrapping in the UI.
+
+        Fire-and-forget: the HTTP POST runs in a background task so the
+        SSE streaming loop never stalls on the 200-500ms round trip.
+        Pending tasks are tracked and flushed before the session is
+        finalized (see ``flush()``).
+
+        Rate-limited.  Returns True if emitted, False if rate-limited.
         """
         now = time.monotonic()
         interval = 0.5 if ephemeral else self.MILESTONE_INTERVAL
@@ -1153,23 +1163,37 @@ class DiscoveryTracker:
         self.last_emit = now
         self.activity_count += 1
 
-        # Use detail directly as body — no prefix, no label.
-        # The action label is set to empty so Linear doesn't display a category prefix.
-        body = detail
+        task = asyncio.create_task(self._do_emit(detail[:500], ephemeral))
+        self._pending_tasks.append(task)
+        # GC completed tasks to prevent unbounded growth
+        self._pending_tasks = [t for t in self._pending_tasks if not t.done()]
+        return True
+
+    async def _do_emit(self, detail: str, ephemeral: bool) -> None:
+        """Actually POST the activity to Linear. Runs in background task."""
         try:
-            return await self.linear.send_action(
+            await self.linear.create_activity(
                 self.session_id,
-                label="",
-                param=detail[:200],
-                body=body,
+                ActivityType.thought,
+                body=detail,
                 ephemeral=ephemeral,
             )
         except Exception:
             log.warning(
-                "DiscoveryTracker: failed to emit %s: %s",
-                kind or "progress", detail[:60],
+                "DiscoveryTracker: failed to emit: %s",
+                detail[:60],
             )
-            return False
+
+    async def flush(self) -> None:
+        """Wait for all pending emit tasks to complete.
+
+        Call before finalizing the session (before ``send_response()``)
+        so all intermediate thought activities are visible in the timeline.
+        """
+        tasks = self._pending_tasks[:]
+        self._pending_tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def keepalive_context(self) -> str:
         """Return the current investigation context for keepalive messages."""
@@ -1753,6 +1777,11 @@ class TaskProcessor:
                 pass
 
         if response_text:
+            # Flush pending thought activities so all intermediate progress
+            # updates are visible in Linear before the final response.
+            if tracker:
+                await tracker.flush()
+
             # Keepalive context already updated during streaming in _call_llm.
             # All content was emitted as paragraph-sized chunks during streaming
             # (including the final flush). No need to re-emit here; just update
@@ -2064,6 +2093,27 @@ class TaskProcessor:
                                     snippet = new_block.strip()[:100]
                                     if snippet:
                                         tracker._keepalive_ctx = _strip_markdown(snippet)
+                                last_thought_time = now
+
+                            # Content-drought emission: when SSE chunks arrive without
+                            # content tokens (e.g., DeepSeek thinking phase with hidden
+                            # reasoning), emit the tracker's contextual keepalive so
+                            # the user sees live progress during the wait instead of
+                            # everything appearing in a burst at the end.
+                            #
+                            # `content` is the current delta's content field.
+                            # When empty but chunks keep arriving, the model is
+                            # reasoning internally (thinking phase). Emit a
+                            # progress update every ~5 seconds during drought.
+                            if (
+                                session_id
+                                and not content
+                                and now - last_thought_time > 5.0
+                            ):
+                                if tracker:
+                                    ctx = tracker.keepalive_context()
+                                    if ctx:
+                                        await tracker.progress(ctx[:200])
                                 last_thought_time = now
 
                         # Final flush: emit remaining un-emitted content after stream ends
