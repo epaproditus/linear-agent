@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -1057,6 +1057,221 @@ def _format_comment_line(depth: int, c: dict[str, Any]) -> str:
     return f"[{ts}] {prefix}{author}: {body}"
 
 
+# ── Discovery Tracker ──────────────────────────────────────────
+
+
+@dataclass
+class DiscoveryTracker:
+    """Tracks and emits discovery activities during issue work.
+
+    Unlike a phase tracker, this has no concept of phase. It provides
+    helpers for emitting findings (found, identified, decided, created,
+    verified) and rate-limits emission to avoid flooding Linear's API.
+
+    Key invariant: every non-keepalive activity carries information
+    the user didn't have before.
+
+    Discovery kinds:
+        Found: A piece of information located during investigation.
+        Identified: A gap, pattern, or relationship recognized.
+        Decided: A choice made between alternatives.
+        Created: An artifact produced.
+        Verified: A validation completed.
+
+    Fire-and-forget: failures during emission are logged but never
+    block or delay the caller.
+    """
+
+    session_id: str
+    linear: LinearClient
+    last_emit: float = 0.0
+    activity_count: int = 0
+    _keepalive_ctx: str = ""
+
+    MIN_ACTIVITY_INTERVAL: float = 1.5
+    """Minimum seconds between any activity emission."""
+    MILESTONE_INTERVAL: float = 3.0
+    """Minimum seconds between persistent (non-ephemeral) milestone activities."""
+
+    async def found(self, detail: str) -> bool:
+        """Emit a discovery: something located during investigation."""
+        return await self._emit("Found", detail, ephemeral=False)
+
+    async def identified(self, detail: str) -> bool:
+        """Emit a discovery: a gap, pattern, or relationship recognized."""
+        return await self._emit("Identified", detail, ephemeral=False)
+
+    async def decided(self, detail: str) -> bool:
+        """Emit a discovery: a choice made between alternatives."""
+        return await self._emit("Decided", detail, ephemeral=False)
+
+    async def created(self, detail: str) -> bool:
+        """Emit a discovery: an artifact produced."""
+        return await self._emit("Created", detail, ephemeral=False)
+
+    async def verified(self, detail: str) -> bool:
+        """Emit a discovery: a validation completed."""
+        return await self._emit("Verified", detail, ephemeral=False)
+
+    async def in_progress(self, description: str) -> bool:
+        """Emit an ephemeral in-progress indicator.
+
+        Updates keepalive context. Replaced by the next ephemeral activity.
+        """
+        self._keepalive_ctx = description
+        return await self._emit("", description, ephemeral=True)
+
+    async def _emit(self, kind: str, detail: str, ephemeral: bool) -> bool:
+        """Rate-limited activity emission. Skips if interval hasn't elapsed.
+
+        Fire-and-forget: never blocks or retries on failure.
+        Returns True if emitted, False if rate-limited or failed.
+        """
+        now = time.monotonic()
+        interval = 0.5 if ephemeral else self.MILESTONE_INTERVAL
+        if now - self.last_emit < interval:
+            log.debug(
+                "DiscoveryTracker: rate-limited %s: %s",
+                kind or "progress", detail[:60],
+            )
+            return False
+        self.last_emit = now
+        self.activity_count += 1
+
+        body = f"{kind}: {detail}" if kind else detail
+        try:
+            return await self.linear.send_action(
+                self.session_id,
+                label=kind or "progress",
+                param=detail[:200],
+                body=body,
+                ephemeral=ephemeral,
+            )
+        except Exception:
+            log.warning(
+                "DiscoveryTracker: failed to emit %s: %s",
+                kind or "progress", detail[:60],
+            )
+            return False
+
+    def keepalive_context(self) -> str:
+        """Return the current investigation context for keepalive messages."""
+        if self._keepalive_ctx:
+            return f"Still: {self._keepalive_ctx}"
+        return "Still working on it..."
+
+
+# ── Tool Result → Discovery Extractors ─────────────────────────
+
+
+def _discovery_read_file(args: dict, result: Any) -> str | None:
+    """Extract discovery: file was read."""
+    if isinstance(result, str) and len(result) > 0:
+        path = args.get("path", "")
+        lines = result.count("\n") + 1
+        # Summarize content briefly
+        preview = result.strip()[:80].replace("\n", " ")
+        return f"Read {path} ({lines} lines): {preview}"
+    return None
+
+
+def _discovery_search_files(args: dict, result: Any) -> str | None:
+    """Extract discovery: file search completed."""
+    if isinstance(result, dict):
+        count = result.get("total_count", 0)
+        if count > 0:
+            return (
+                f"Found {count} matches for"
+                f" '{args.get('pattern', '')[:40]}' in {args.get('path', '.')}"
+            )
+        return "No matches found"
+    return None
+
+
+def _discovery_web_search(args: dict, result: Any) -> str | None:
+    """Extract discovery: web search results."""
+    if isinstance(result, dict):
+        results = result.get("results", [])
+        if results:
+            titles = [r.get("title", "")[:40] for r in results[:3]]
+            return (
+                f"Found {len(results)} web results for"
+                f" '{args.get('query', '')[:50]}': {', '.join(titles)}"
+            )
+        return "No web results found"
+    return None
+
+
+def _discovery_web_extract(args: dict, result: Any) -> str | None:
+    """Extract discovery: URL content fetched."""
+    if isinstance(result, str) and len(result) > 0:
+        urls = args.get("urls", ["?"])
+        url = urls[0][:60] if urls else "?"
+        return f"Fetched {url} ({len(result)} chars)"
+    return None
+
+
+def _discovery_execute_code(args: dict, result: Any) -> str | None:
+    """Extract discovery: code executed."""
+    if isinstance(result, dict) and result.get("status") == "success":
+        outputs = result.get("output", "")
+        preview = outputs[:80].replace("\n", " ") if outputs else "no output"
+        return f"Code executed: {preview}"
+    return None
+
+
+_DISCOVERY_EXTRACTORS: dict[str, Callable[[dict, Any], str | None]] = {
+    "read_file": _discovery_read_file,
+    "search_files": _discovery_search_files,
+    "web_search": _discovery_web_search,
+    "web_extract": _discovery_web_extract,
+    "execute_code": _discovery_execute_code,
+}
+
+
+def extract_discovery(tool_name: str, args: dict, result: Any) -> str | None:
+    """Return a discovery statement from a completed tool call, or None.
+
+    Looks up *tool_name* in ``_DISCOVERY_EXTRACTORS`` and calls the
+    registered extractor. Returns None if no extractor is registered
+    or if extraction fails silently.
+    """
+    extractor = _DISCOVERY_EXTRACTORS.get(tool_name)
+    if extractor is None:
+        return None
+    try:
+        return extractor(args, result)
+    except Exception:
+        return None
+
+
+# ── LLM Finding Extraction ─────────────────────────────────────
+
+
+_FINDING_PATTERNS = re.compile(
+    r"(Found|Identified|Decided|Created|Verified|Root cause|The issue is|Going with)",
+    re.IGNORECASE,
+)
+
+
+def extract_llm_finding(accumulated: str, known_findings: set[str]) -> str | None:
+    """Check accumulated LLM output for a new finding statement.
+
+    Scans lines in reverse (most recent first) for finding keywords.
+    Returns the first complete statement not seen before, or None.
+    """
+    lines = accumulated.split("\n")
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or len(stripped) < 15:
+            continue
+        if _FINDING_PATTERNS.search(stripped):
+            finding = stripped.rstrip(".").strip()[:200]
+            if finding not in known_findings:
+                return finding
+    return None
+
+
 # ── Task Processor ──────────────────────────────────────────────────────
 
 
@@ -1446,6 +1661,7 @@ class TaskProcessor:
         """Non-coding task: use LLM to reason and respond intelligently."""
         identifier = issue.get("identifier", session.issue_identifier)
         description = issue.get("description", session.description) or ""
+        title = issue.get("title", session.title) or ""
 
         # ── Deterministic conversation reconstruction ──
         # Always show ALL issue comments chronologically (full body, no truncation).
@@ -1479,22 +1695,18 @@ class TaskProcessor:
             session, issue, conversation_text, user_request, internal_text,
         )
 
-        # Emit ephemeral thought so Linear doesn't mark session unresponsive while LLM runs
-        await self.linear.create_activity(
-            session_id,
-            ActivityType.thought,
-            body="Thinking...",
-            ephemeral=True,
-        )
+        # Initialize DiscoveryTracker for result-oriented progress updates
+        tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
+        await tracker.found(f"Processing {identifier}: {title[:80]}")
 
         # Start background keepalive to continue sending activity during long LLM calls
         keepalive_task = asyncio.create_task(
-            self._keep_session_alive(session_id)
+            self._keep_session_alive(session_id, tracker)
         )
 
         try:
-            # Call LLM for reasoning
-            response_text = await self._call_llm(prompt, session_id)
+            # Call LLM for reasoning with discovery extraction
+            response_text = await self._call_llm(prompt, session_id, tracker)
         finally:
             keepalive_task.cancel()
             try:
@@ -1520,9 +1732,13 @@ class TaskProcessor:
                 f"Could not generate a response. Status: {issue.get('state', {}).get('name', 'Unknown')}",
             )
 
-    async def _call_llm(self, prompt: str, session_id: str = "") -> str | None:
+    async def _call_llm(
+        self, prompt: str, session_id: str = "",
+        tracker: DiscoveryTracker | None = None,
+    ) -> str | None:
         """Call Hermes API server for reasoning with streaming support.
         Streams thinking tokens as thought activities when session_id is provided.
+        Extracts discovery findings from LLM output when tracker is provided.
         Retries once (5s backoff) on timeout or 5xx responses.
         Logs response length and elapsed time on every successful 200 response.
         """
@@ -1531,6 +1747,7 @@ class TaskProcessor:
             return None
 
         last_thought_time = 0.0
+        known_findings: set[str] = set()
 
         for attempt in range(2):
             start = time.monotonic()
@@ -1605,19 +1822,36 @@ class TaskProcessor:
                             if content:
                                 accumulated += content
 
-                            # Emit periodic thought during long streams
+                            # Emit periodic discovery or thought during long streams
                             now = time.monotonic()
                             if session_id and content and now - last_thought_time > 10:
-                                snippet = content[-60:].strip()
-                                if snippet:
-                                    display = f"💭 ...{snippet}"
+                                # Try to extract a finding statement first
+                                finding = extract_llm_finding(accumulated, known_findings)
+                                if finding and tracker:
+                                    # Route to the right discovery kind based on prefix
+                                    if finding.startswith("Identified"):
+                                        await tracker.identified(finding)
+                                    elif finding.startswith("Decided"):
+                                        await tracker.decided(finding)
+                                    elif finding.startswith("Created"):
+                                        await tracker.created(finding)
+                                    elif finding.startswith("Verified"):
+                                        await tracker.verified(finding)
+                                    else:
+                                        await tracker.found(finding)
+                                    known_findings.add(finding)
+                                else:
+                                    # Fall back to contextual thought from tracker
+                                    display = tracker.keepalive_context() if tracker else "Still thinking..."
+                                    if len(display) < 5:
+                                        display = "Still working on it..."
                                     await self.linear.create_activity(
                                         session_id,
                                         ActivityType.thought,
                                         body=display,
                                         ephemeral=True,
                                     )
-                                    last_thought_time = now
+                                last_thought_time = now
 
                 elapsed = time.monotonic() - start
                 result = accumulated.strip() if accumulated else None
@@ -1663,16 +1897,17 @@ class TaskProcessor:
 
         return None
 
-    async def _keep_session_alive(self, session_id: str) -> None:
+    async def _keep_session_alive(self, session_id: str, tracker: DiscoveryTracker | None = None) -> None:
         """Periodically emit ephemeral thoughts to keep the session alive
-        during long LLM processing."""
+        during long LLM processing. Uses tracker context when available."""
         while True:
             await asyncio.sleep(KEEPALIVE_INTERVAL_S)
             try:
+                ctx = tracker.keepalive_context() if tracker else "Still working on it..."
                 await self.linear.create_activity(
                     session_id,
                     ActivityType.thought,
-                    body="Still thinking...",
+                    body=ctx,
                     ephemeral=True,
                 )
                 log.debug("Keepalive thought sent for session %s", session_id)
