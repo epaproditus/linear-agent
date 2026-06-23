@@ -1994,8 +1994,6 @@ class TaskProcessor:
 
         last_thought_time = 0.0
         known_findings: set[str] = set()
-        _last_checked_len = 0  # Track content already scanned for findings
-        _last_emitted_pos = 0  # Track position of last emitted sentence
 
         for attempt in range(2):
             start = time.monotonic()
@@ -2120,53 +2118,12 @@ class TaskProcessor:
                             content = delta.get("content", "")
                             if content:
                                 accumulated += content
+                                # Update keepalive context with latest content
+                                snippet = content.strip()[:100]
+                                if snippet and tracker:
+                                    tracker._keepalive_ctx = _strip_markdown(snippet)
 
-                            # Emit periodic progress during long streams
                             now = time.monotonic()
-                            if session_id and content and now - last_thought_time > 1.0:
-                                _last_checked_len = len(accumulated)
-                                if tracker:
-                                    new_block = accumulated[_last_emitted_pos:]
-                                    if len(new_block) >= 60:
-                                        # Skip leading newlines (leftover from previous emissions)
-                                        lead_nl = len(new_block) - len(new_block.lstrip('\n'))
-                                        if lead_nl:
-                                            _last_emitted_pos += lead_nl
-                                            new_block = new_block[lead_nl:]
-
-                                        # Priority: emit complete paragraphs (separated by \n\n).
-                                        # This gives Cursor-style paragraph-sized chunks.
-                                        para_end = new_block.find('\n\n')
-                                        if para_end > 0:
-                                            to_emit = new_block[:para_end]
-                                            block = _strip_markdown(to_emit)
-                                            if block:
-                                                _last_emitted_pos += para_end + 2
-                                                await progress_worker.put(block[:500])
-                                        # Fallback: un-emitted text is long with no paragraph break
-                                        elif len(new_block) >= 300:
-                                            for sep in ('. ', '! ', '? '):
-                                                idx = new_block.rfind(sep, 100, 280)
-                                                if idx > 0:
-                                                    to_emit = new_block[:idx + 1]
-                                                    block = _strip_markdown(to_emit)
-                                                    if block:
-                                                        _last_emitted_pos += idx + 1
-                                                        await progress_worker.put(block[:500])
-                                                    break
-                                            else:
-                                                # Last resort: break at space
-                                                idx = new_block.rfind(' ', 60, 250)
-                                                if idx > 0:
-                                                    block = _strip_markdown(new_block[:idx])
-                                                    if block:
-                                                        _last_emitted_pos += idx
-                                                        await progress_worker.put(block[:500])
-                                    # Update keepalive context (strip markdown for clean keepalive thoughts)
-                                    snippet = new_block.strip()[:100]
-                                    if snippet:
-                                        tracker._keepalive_ctx = _strip_markdown(snippet)
-                                last_thought_time = now
 
                             # Content-drought emission: when SSE chunks arrive without
                             # content tokens (e.g., DeepSeek thinking phase with hidden
@@ -2188,17 +2145,6 @@ class TaskProcessor:
                                     if ctx:
                                         await progress_worker.put(ctx[:200])
                                 last_thought_time = now
-
-                        # Final flush: emit remaining un-emitted content after stream ends
-                        if tracker and _last_emitted_pos < len(accumulated):
-                            remaining = accumulated[_last_emitted_pos:]
-                            if remaining.strip():
-                                block = _strip_markdown(remaining)
-                                if block:
-                                    # Bypass rate limiter to ensure final progress goes through
-                                    tracker.last_emit = 0.0
-                                    _last_emitted_pos = len(accumulated)
-                                    await progress_worker.put(block[:500])
 
                 elapsed = time.monotonic() - start
                 result = accumulated.strip() if accumulated else None
