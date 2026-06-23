@@ -12,70 +12,65 @@ or accomplished. Each activity carries new information.
 
 There are two sources of discoveries:
 
-1. **Tool result extraction** — When Hermes calls a tool (read_file, search_files),
-   the linear agent executes the same tool locally on the same machine and
-   extracts a discovery from the result.
-2. **LLM finding extraction** — As the LLM generates its response, the linear
-   agent scans the stream for finding-like statements (sentences starting with
-   "Found:", "Identified:", "The issue is:", etc.) and emits them as discoveries.
+1. **LLM text stream extraction** — As the LLM generates its response, the
+   Linear agent scans the stream for finding-like statements (sentences
+   starting with "Found:", "Identified:", "Decided:", "Created:", etc.)
+   and emits them as discoveries. When no explicit finding is found, the
+   first meaningful sentence from new content is emitted as an in-progress
+   update.
+
+2. **Investigation milestones** — Before and after the LLM call, the agent
+   emits milestone activities (initial discovery, final response summary).
+
+Note: Unlike the original plan, tool calls are NOT intercepted at the
+Linear agent level. The Hermes API server executes all tools internally
+and returns only text. All discoveries come from the text stream.
 
 ## Discovery Kinds
 
 | Kind | Meaning | Example |
 |------|---------|---------|
-| Found | A piece of information located | "Read linear_agent.py (650 lines): class DiscoveryTracker..." |
+| Found | A piece of information located | "Found: streaming code at line 1523" |
 | Identified | A gap, pattern, or relationship | "Identified three gaps in activity emission" |
 | Decided | A choice between alternatives | "Decided to use result-oriented model" |
-| Created | An artifact produced | "Response generated for PLY-41" |
+| Created | An artifact produced | "Created implementation plan" |
 | Verified | A validation completed | "Verified all tests pass after changes" |
 
 ## What You'll See (Typical Timeline)
 
 ```
 [+1s]  Found: Processing PLY-41 — Implement streaming progress updates
-[+3s]  Found: Read linear_agent.py: class DiscoveryTracker at line 1064
-[+6s]  Found: Searching for 'DiscoveryTracker' in linear_agent.py
-[+10s] Still: exploring the codebase...
-[+15s] Found: The implementation is missing tool result extraction
-[+20s] Response generated for PLY-41
+[+3s]  Still: analyzing the issue and planning next steps
+[+6s]  (in-progress) Let me start by exploring the codebase to understand...
+[+15s] (in-progress) Found the streaming infrastructure at lines 1523-1665
+[+30s] Created: Response generated for PLY-41
 ```
 
-## Tool Result Extraction
-
-After each tool call, the linear agent executes the same tool locally in
-parallel and extracts a discovery statement from the result:
-
-- **read_file** → "Read {path} ({lines} lines): {first 80 chars}"
-- **search_files** → "Found {N} matches for '{pattern}' in {path}"
-- **web_extract** → "Fetched {url} ({N} chars)"
-- **execute_code** → "Code executed: {output preview}"
-
-If local execution fails or the tool isn't available locally
-(e.g., web_search without API key), a lightweight discovery is
-generated from the tool name and arguments alone.
+During long LLM calls (>3s), new text content is emitted as in-progress
+activities every ~3 seconds. If the LLM follows the finding-prefix format
+(Found:, Identified:, etc.), these appear as real discovery milestones.
 
 ## LLM Finding Extraction
 
-During streaming, the linear agent scans the LLM output every 5 seconds for
-finding statements:
+During streaming, the Linear agent scans the LLM output every 3 seconds for:
 
-1. **Keyword-prefixed** — Lines starting with Found:, Identified:, Decided:,
+1. **Keyword-prefixed** — Lines matching Found:, Identified:, Decided:,
    Created:, Verified:, Root cause:, The issue is:, etc.
 2. **Natural language fallback** — Sentences starting with "the ", "this ",
-   "it ", "we ", "i " followed by meaningful verbs (is, was, has, contains,
-   shows, reveals, indicates, etc.)
+   "it ", "we ", "i " followed by meaningful verbs.
+3. **Content sentence extraction** — If no finding keywords are found, the
+   first complete sentence from new stream content is emitted as an
+   in-progress indicator.
 
-The prompt includes instructions encouraging the LLM to output findings
-naturally as it works.
+The LLM prompt includes instructions encouraging natural finding output.
 
 ## Keepalive Activities
 
-When no new discovery is ready for more than 5 seconds (during long LLM
-calls), Hermes emits contextual keepalive messages:
+When no new content is generated for more than 3 seconds (during pauses
+in LLM streaming), the background keepalive task emits contextual messages:
 
-- "Still: exploring the codebase..."
-- "Still: analyzing the streaming loop..."
-- "Still working on it..." (fallback)
+- "Still: analyzing the issue and planning next steps" (initial context)
+- "Still working on it..." (fallback when no context set)
 
 These are ephemeral — they don't clutter the permanent timeline.
 
@@ -98,3 +93,7 @@ These are ephemeral — they don't clutter the permanent timeline.
 
 4. **Fire-and-forget.** Activity emission never blocks or delays the actual
    work. API errors are logged and ignored.
+
+5. **Text-stream only.** Tool calls happen inside the Hermes API server
+   and are not visible to the Linear agent. All discoveries derive from
+   the text the LLM generates.

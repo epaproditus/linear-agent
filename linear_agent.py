@@ -1298,7 +1298,7 @@ def extract_llm_finding(accumulated: str, known_findings: set[str]) -> str | Non
     lines = accumulated.split("\n")
     for line in reversed(lines):
         stripped = line.strip()
-        if not stripped or len(stripped) < 15:
+        if not stripped or len(stripped) < 10:
             continue
         # Level 1: explicit keyword prefix
         if _FINDING_PATTERNS.search(stripped):
@@ -1324,6 +1324,44 @@ def _truncate_finding(text: str, max_len: int = 200) -> str:
             return truncated[:last_period + 1]
         return truncated + "..."
     return text
+
+
+def _extract_first_sentence(text: str, min_len: int = 20) -> str | None:
+    """Extract the first meaningful sentence from text for progress display.
+
+    Finds the first complete sentence (ending with . ! or ?) that's at least
+    *min_len* characters. Handles common abbreviations (e.g., 'Dr.', 'Mr.',
+    'vs.', 'etc.') to avoid false sentence boundaries.
+    Returns None if no suitable sentence is found.
+    """
+    # Abbreviations that should not end a sentence
+    abbr_pattern = re.compile(
+        r'\b(?:Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|'
+        r'Inc|Corp|Ltd|Co|e\.g|i\.e|al|fig|ref|sec|chap|vol|no)\.$',
+        re.IGNORECASE,
+    )
+    # Numbered items (e.g., "1.", "2.") are not sentences
+    numbered_pattern = re.compile(r'^\d+\.\s')
+
+    clean = text.strip()
+    if not clean or len(clean) < min_len:
+        return None
+
+    # Try to find a complete sentence
+    for sep in ('.', '!', '?'):
+        for candidate in clean.split(sep):
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            if numbered_pattern.match(candidate):
+                continue
+            if len(candidate) >= min_len and not abbr_pattern.search(candidate):
+                return (candidate + sep)[:200]
+    # Fallback: first N characters that form a complete thought
+    fallback = clean[:100].rstrip(',').strip()
+    if len(fallback) >= min_len:
+        return fallback
+    return None
 
 
 async def _route_and_emit_finding(
@@ -1783,6 +1821,8 @@ class TaskProcessor:
         # Initialize DiscoveryTracker for result-oriented progress updates
         tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
         await tracker.found(f"Processing {identifier}: {title[:80]}")
+        # Set initial keepalive context so the background timer emits meaningful messages
+        await tracker.in_progress("analyzing the issue and planning next steps")
 
         # Start background keepalive to continue sending activity during long LLM calls
         keepalive_task = asyncio.create_task(
@@ -1943,6 +1983,7 @@ class TaskProcessor:
 
         last_thought_time = 0.0
         known_findings: set[str] = set()
+        _last_checked_len = 0  # Track content already scanned for findings
 
         for attempt in range(2):
             start = time.monotonic()
@@ -2062,14 +2103,33 @@ class TaskProcessor:
                             if content:
                                 accumulated += content
 
-                            # Emit periodic discovery or thought during long streams
+                            # Emit periodic discovery or in-progress during long streams
                             now = time.monotonic()
-                            THOUGHT_INTERVAL = 5.0  # Check every 5s for findings
-                            if session_id and content and now - last_thought_time > THOUGHT_INTERVAL:
+                            if session_id and content and now - last_thought_time > 3.0:
+                                # Only scan NEW content since last check
+                                new_content = accumulated[_last_checked_len:]
                                 # Try to extract a finding statement first
                                 finding = extract_llm_finding(accumulated, known_findings)
                                 if finding and tracker:
                                     await _route_and_emit_finding(finding, tracker, known_findings)
+                                    _last_checked_len = len(accumulated)
+                                elif len(new_content) > 30 and tracker:
+                                    # Emit the first meaningful sentence from new content as in_progress
+                                    sentence = _extract_first_sentence(new_content)
+                                    if sentence:
+                                        await tracker.in_progress(sentence)
+                                        _last_checked_len = len(accumulated)
+                                    else:
+                                        # Fall back to contextual keepalive
+                                        display = tracker.keepalive_context()
+                                        if len(display) < 5:
+                                            display = "Still working on it..."
+                                        await self.linear.create_activity(
+                                            session_id,
+                                            ActivityType.thought,
+                                            body=display,
+                                            ephemeral=True,
+                                        )
                                 else:
                                     # Fall back to contextual thought from tracker
                                     display = tracker.keepalive_context() if tracker else "Still thinking..."
