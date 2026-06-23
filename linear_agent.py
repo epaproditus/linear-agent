@@ -1195,6 +1195,13 @@ class DiscoveryTracker:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def keepalive_context(self) -> str:
+        """Return the current investigation context for keepalive messages."""
+        if self._keepalive_ctx:
+            # Capitalize first letter for natural reading
+            return self._keepalive_ctx[0].upper() + self._keepalive_ctx[1:]
+        return "Working on it..."
+
 
 class ProgressQueueWorker:
     """Dedicated background worker that drains a queue of progress text
@@ -1250,13 +1257,6 @@ class ProgressQueueWorker:
             while not self._queue.empty():
                 self._queue.get_nowait()
                 self._queue.task_done()
-
-    def keepalive_context(self) -> str:
-        """Return the current investigation context for keepalive messages."""
-        if self._keepalive_ctx:
-            # Capitalize first letter for natural reading
-            return self._keepalive_ctx[0].upper() + self._keepalive_ctx[1:]
-        return "Working on it..."
 
 
 # ── Tool Result → Discovery Extractors ─────────────────────────
