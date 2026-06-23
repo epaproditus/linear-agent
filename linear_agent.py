@@ -1249,7 +1249,40 @@ def extract_discovery(tool_name: str, args: dict, result: Any) -> str | None:
 
 
 _FINDING_PATTERNS = re.compile(
-    r"(Found|Identified|Decided|Created|Verified|Root cause|The issue is|Going with)",
+    r"(?:"
+    r"Found(?: the| a| that|:)|"
+    r"Identified(?: the| a| that|:)|"
+    r"Decided(?: to| that|:)|"
+    r"Created(?: the| a|:)|"
+    r"Verified(?: that| the|:)|"
+    r"Root cause(?: is|:)|"
+    r"The issue(?: is|:)|"
+    r"The problem(?: is|:)|"
+    r"Going with|"
+    r"Discovered(?: that|:)|"
+    r"Confirmed(?: that|:)|"
+    r"Realized(?: that|:)|"
+    r"Noticed(?: that|:)|"
+    r"It looks like|"
+    r"I can see that|"
+    r"I found|"
+    r"I identified|"
+    r"I decided|"
+    r"The key finding|"
+    r"This means|"
+    r"Turns out|"
+    r"After investigating|"
+    r"Investigation revealed|"
+    r"Analysis show"
+    r")",
+    re.IGNORECASE,
+)
+
+# Fallback: simple meaningful sentence patterns (non-keyword)
+_FINDING_FALLBACK = re.compile(
+    r"^(?:the |this |it |there |we |i )"
+    r"(?:is|was|has|have|contains|shows|reveals|indicates|suggests|requires|needs|uses|spans|covers|includes|produces|extracts|handles|provides|takes|runs|implements)"
+    r"\b",
     re.IGNORECASE,
 )
 
@@ -1257,7 +1290,9 @@ _FINDING_PATTERNS = re.compile(
 def extract_llm_finding(accumulated: str, known_findings: set[str]) -> str | None:
     """Check accumulated LLM output for a new finding statement.
 
-    Scans lines in reverse (most recent first) for finding keywords.
+    Scans lines in reverse (most recent first) for:
+    1. Explicit finding keywords (Found:, Identified:, etc.)
+    2. Discovery-like natural language sentences (fallback)
     Returns the first complete statement not seen before, or None.
     """
     lines = accumulated.split("\n")
@@ -1265,11 +1300,47 @@ def extract_llm_finding(accumulated: str, known_findings: set[str]) -> str | Non
         stripped = line.strip()
         if not stripped or len(stripped) < 15:
             continue
+        # Level 1: explicit keyword prefix
         if _FINDING_PATTERNS.search(stripped):
-            finding = stripped.rstrip(".").strip()[:200]
+            finding = _truncate_finding(stripped)
+            if finding not in known_findings:
+                return finding
+        # Level 2: meaningful sentence about code/issue state
+        if _FINDING_FALLBACK.match(stripped):
+            finding = _truncate_finding(stripped)
             if finding not in known_findings:
                 return finding
     return None
+
+
+def _truncate_finding(text: str, max_len: int = 200) -> str:
+    """Clean and truncate a finding statement."""
+    text = text.rstrip(".").strip()
+    if len(text) > max_len:
+        # Try to break at sentence boundary
+        truncated = text[:max_len]
+        last_period = truncated.rfind(".")
+        if last_period > 20:
+            return truncated[:last_period + 1]
+        return truncated + "..."
+    return text
+
+
+async def _route_and_emit_finding(
+    finding: str, tracker: DiscoveryTracker, known_findings: set[str],
+) -> None:
+    """Route a finding string to the right discovery kind and emit."""
+    if finding.startswith("Identified"):
+        await tracker.identified(finding)
+    elif finding.startswith("Decided"):
+        await tracker.decided(finding)
+    elif finding.startswith("Created"):
+        await tracker.created(finding)
+    elif finding.startswith("Verified"):
+        await tracker.verified(finding)
+    else:
+        await tracker.found(finding)
+    known_findings.add(finding)
 
 
 # ── Task Processor ──────────────────────────────────────────────────────
@@ -1418,6 +1489,13 @@ class TaskProcessor:
                 f"{conversation_text}\n"
                 f"User: {user_request}\n"
                 f"\n"
+                f"As you work, output findings naturally — when you discover"
+                f" something, recognize a pattern, make a decision, create"
+                f" something, or verify a result, the user sees those as"
+                f" real-time progress. Start key findings with Found:,"
+                f" Identified:, Decided:, Created:, or Verified: so they"
+                f" appear as structured progress updates.\n"
+                f"\n"
                 f"Respond to the new message. If it asks you to do something,"
                 f" do it now with your tools and report the result."
                 f" If it's casual conversation, just reply naturally."
@@ -1445,7 +1523,14 @@ class TaskProcessor:
                 f"{internal_text}\n"
                 f"{conversation_text}\n"
                 f"\n"
-                f"User's message: {user_request}\n"
+                f"User: {user_request}\n"
+                f"\n"
+                f"As you work, output findings naturally — when you discover"
+                f" something, recognize a pattern, make a decision, create"
+                f" something, or verify a result, the user sees those as"
+                f" real-time progress. Start key findings with Found:,"
+                f" Identified:, Decided:, Created:, or Verified: so they"
+                f" appear as structured progress updates.\n"
                 f"\n"
                 f"Do what needs to be done. Use your tools and report what you"
                 f" actually did and found. If it's casual or needs discussion,"
@@ -1715,6 +1800,14 @@ class TaskProcessor:
                 pass
 
         if response_text:
+            # Extract key findings from the response and emit
+            if tracker:
+                await tracker.created(f"Response generated for {identifier}")
+                # Try to extract first finding sentence from response
+                resp_finding = extract_llm_finding(response_text, set())
+                if resp_finding and len(resp_finding) > 15:
+                    await tracker.found(resp_finding)
+
             await self.linear.send_response(session_id, response_text)
             # Task complete — move to "In Review" for the user
             if session.action != SessionAction.prompted:
@@ -1731,6 +1824,108 @@ class TaskProcessor:
                 session_id,
                 f"Could not generate a response. Status: {issue.get('state', {}).get('name', 'Unknown')}",
             )
+
+    def _make_tool_discovery(self, tool_name: str, args: dict) -> str | None:
+        """Generate a discovery statement from a tool call name and arguments.
+
+        Runs without executing the tool (works from the stream metadata alone).
+        For richer extraction, use _execute_tool_locally + extract_discovery().
+        """
+        if tool_name == "read_file":
+            path = args.get("path", "")
+            if path:
+                return f"Investigating {path}"
+        elif tool_name == "search_files":
+            pattern = args.get("pattern", "")
+            search_path = args.get("path", ".")
+            if pattern:
+                return f"Searching for '{pattern[:40]}' in {search_path}"
+        elif tool_name == "web_search":
+            query = args.get("query", "")
+            if query:
+                return f"Searching web for '{query[:50]}'"
+        elif tool_name == "web_extract":
+            urls = args.get("urls", [])
+            if urls:
+                return f"Fetching {urls[0][:60]}"
+        elif tool_name == "execute_code":
+            code = args.get("code", "")
+            preview = code[:50].replace("\n", " ") if code else ""
+            if preview:
+                return f"Running code: {preview}"
+        return None
+
+    async def _execute_tool_locally(
+        self, tool_name: str, args: dict,
+    ) -> dict | str | None:
+        """Execute a tool locally on the same machine for discovery extraction.
+
+        Runs independently of the Hermes API's own tool execution. The result
+        is used only for discovery extraction, not for the LLM's reasoning.
+        Returns a result dict compatible with ``_DISCOVERY_EXTRACTORS``,
+        or None if the tool can't be executed locally.
+        """
+        try:
+            if tool_name == "read_file":
+                path = args.get("path", "")
+                if not path:
+                    return None
+                # Expand ~/ and env vars
+                path = os.path.expanduser(os.path.expandvars(path))
+                if not os.path.isfile(path):
+                    return None
+                with open(path) as f:
+                    content = f.read(2000)  # First 2000 chars enough for discovery
+                return content
+
+            elif tool_name == "search_files":
+                pattern = args.get("pattern", "")
+                search_path = args.get("path", ".")
+                file_glob = args.get("file_glob", "")
+                search_path = os.path.expanduser(os.path.expandvars(search_path))
+                if not pattern:
+                    return None
+                cmd = ["grep", "-rl", pattern, search_path]
+                if file_glob:
+                    cmd = ["grep", "-rl", f"--include={file_glob}", pattern, search_path]
+                r = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await r.communicate()
+                matches = stdout.decode().strip().split("\n") if stdout.strip() else []
+                return {"total_count": len(matches), "matches": matches[:20]}
+
+            elif tool_name == "web_extract":
+                urls = args.get("urls", [])
+                if not urls:
+                    return None
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(urls[0], headers={"User-Agent": "HermesLinearAgent/1.0"})
+                    if resp.status_code == 200:
+                        return resp.text[:2000]
+                return None
+
+            elif tool_name == "execute_code":
+                code = args.get("code", "")
+                if not code:
+                    return None
+                r = await asyncio.create_subprocess_exec(
+                    "python3", "-c", code,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    r.communicate(), timeout=30,
+                )
+                return {
+                    "status": "success" if r.returncode == 0 else "error",
+                    "output": (stdout.decode() + stderr.decode())[:2000],
+                }
+
+            return None
+        except Exception:
+            log.debug("Local tool execution failed for %s: not available", tool_name)
+            return None
 
     async def _call_llm(
         self, prompt: str, session_id: str = "",
@@ -1782,6 +1977,9 @@ class TaskProcessor:
                                 continue
                             return None
 
+                        # Track tool calls from the stream for local discovery extraction
+                        tool_calls_map: dict[int, dict] = {}
+
                         async for line in resp.aiter_lines():
                             if not line.startswith("data: "):
                                 continue
@@ -1798,24 +1996,66 @@ class TaskProcessor:
                                 continue
                             delta = choices[0].get("delta", {})
 
-                            # Detect tool calls → emit action activity
+                            # ── Tool Call Accumulation ──
                             tool_calls = delta.get("tool_calls")
-                            if tool_calls and session_id:
+                            if tool_calls:
                                 for tc in tool_calls:
+                                    idx = tc.get("index", 0)
+                                    if idx not in tool_calls_map:
+                                        tool_calls_map[idx] = {
+                                            "id": "", "type": "function",
+                                            "function": {"name": "", "arguments": ""},
+                                        }
+                                    if tc.get("id"):
+                                        tool_calls_map[idx]["id"] = tc["id"]
                                     fn = tc.get("function", {})
-                                    fn_name = fn.get("name", "")
-                                    fn_args = fn.get("arguments", "")
-                                    if fn_name:
+                                    if fn.get("name"):
+                                        tool_calls_map[idx]["function"]["name"] = fn["name"]
+                                    if fn.get("arguments"):
+                                        tool_calls_map[idx]["function"]["arguments"] += fn["arguments"]
+                                    # Emit action activity for the tool call
+                                    fn_name = tool_calls_map[idx]["function"]["name"]
+                                    if fn_name and session_id and idx == len(tool_calls_map) - 1:
                                         await self.linear.create_activity(
                                             session_id,
                                             ActivityType.action,
-                                            body=f"🛠️ **{fn_name}**",
+                                            body=f"**{fn_name}** {(', '.join(f'{k}={v}' for k, v in json.loads(tool_calls_map[idx]['function']['arguments'] or '{}').items()))[:100]}",
                                             action_label=fn_name,
-                                            action_param=fn_args[:100],
+                                            action_param=tool_calls_map[idx]["function"]["arguments"][:100],
                                             ephemeral=True,
                                         )
                                         log.info("Stream: tool call %s", fn_name)
                                         last_thought_time = time.monotonic()
+
+                            # ── Detect completion of tool calls ──
+                            # If tool_calls_map has items and current delta has no tool_calls,
+                            # the tool call batch completed — execute locally for discovery.
+                            finish_reason = choices[0].get("finish_reason")
+                            if tool_calls_map and (not tool_calls or finish_reason == "tool_calls"):
+                                # Execute all accumulated tool calls locally for discovery extraction
+                                for idx in sorted(tool_calls_map.keys()):
+                                    tc = tool_calls_map[idx]
+                                    fn_name = tc["function"]["name"]
+                                    try:
+                                        fn_args = json.loads(tc["function"]["arguments"] or "{}")
+                                    except json.JSONDecodeError:
+                                        fn_args = {}
+                                    if fn_name and tracker:
+                                        # First try: execute locally and extract from result
+                                        local_result = await self._execute_tool_locally(fn_name, fn_args)
+                                        if local_result is not None:
+                                            discovery = extract_discovery(fn_name, fn_args, local_result)
+                                        else:
+                                            discovery = None
+                                        # Fallback: generate from tool name+args alone
+                                        if not discovery:
+                                            discovery = self._make_tool_discovery(fn_name, fn_args)
+                                        if discovery:
+                                            # Found kind for tool results
+                                            known_findings.add(discovery)
+                                            await tracker.found(discovery)
+                                tool_calls_map.clear()
+                                last_thought_time = time.monotonic()
 
                             # Accumulate content
                             content = delta.get("content", "")
@@ -1824,22 +2064,12 @@ class TaskProcessor:
 
                             # Emit periodic discovery or thought during long streams
                             now = time.monotonic()
-                            if session_id and content and now - last_thought_time > 10:
+                            THOUGHT_INTERVAL = 5.0  # Check every 5s for findings
+                            if session_id and content and now - last_thought_time > THOUGHT_INTERVAL:
                                 # Try to extract a finding statement first
                                 finding = extract_llm_finding(accumulated, known_findings)
                                 if finding and tracker:
-                                    # Route to the right discovery kind based on prefix
-                                    if finding.startswith("Identified"):
-                                        await tracker.identified(finding)
-                                    elif finding.startswith("Decided"):
-                                        await tracker.decided(finding)
-                                    elif finding.startswith("Created"):
-                                        await tracker.created(finding)
-                                    elif finding.startswith("Verified"):
-                                        await tracker.verified(finding)
-                                    else:
-                                        await tracker.found(finding)
-                                    known_findings.add(finding)
+                                    await _route_and_emit_finding(finding, tracker, known_findings)
                                 else:
                                     # Fall back to contextual thought from tracker
                                     display = tracker.keepalive_context() if tracker else "Still thinking..."
