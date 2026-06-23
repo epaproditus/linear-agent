@@ -1826,7 +1826,6 @@ class TaskProcessor:
 
         # Initialize DiscoveryTracker for result-oriented progress updates
         tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
-        await tracker.found(f"Processing {identifier}: {title[:80]}")
         # Set initial keepalive context so the background timer emits meaningful messages
         await tracker.in_progress("analyzing the issue and planning next steps")
 
@@ -2119,10 +2118,10 @@ class TaskProcessor:
                                 if finding and tracker:
                                     await _route_and_emit_finding(finding, tracker, known_findings)
                                 elif new_content and tracker:
-                                    # Emit latest content as in-progress discovery — show progress always
+                                    # Emit latest content as persistent milestone — show progress always
                                     display = new_content.strip()[:200]
                                     if len(display) >= 5:
-                                        await tracker.in_progress(display)
+                                        await tracker.found(display)
                                 else:
                                     # No new content — use keepalive context from background task
                                     display = tracker.keepalive_context() if tracker else "Still working on it..."
