@@ -1266,54 +1266,33 @@ def extract_discovery(tool_name: str, args: dict, result: Any) -> str | None:
 # ── LLM Text Streaming ────────────────────────────────────────
 
 
-def _extract_first_sentence(text: str, min_len: int = 30) -> str | None:
-    """Extract the first meaningful sentence from text for progress display.
+def _strip_markdown(text: str) -> str:
+    """Remove common markdown syntax for clean display in Linear activities.
 
-    Finds the first complete sentence (ending with . ! or ?) that's at least
-    *min_len* characters. Handles common abbreviations (e.g., 'Dr.', 'Mr.',
-    'vs.', 'etc.) to avoid false sentence boundaries.
-    Skips fragments that start with lowercase, commas, or common filler words.
-    Returns None if no suitable sentence is found.
+    Strips bold, italic, inline code, links, headers, list markers, and
+    code blocks so the text reads naturally in Linear's activity feed.
+    Collapses multiple blank lines but preserves actual paragraph breaks.
     """
-    # Abbreviations that should not end a sentence
-    abbr_pattern = re.compile(
-        r'\b(?:Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St|vs|etc|approx|dept|est|govt|'
-        r'Inc|Corp|Ltd|Co|e\.g|i\.e|al|fig|ref|sec|chap|vol|no)\.$',
-        re.IGNORECASE,
-    )
-    # Numbered items (e.g., "1.", "2.") are not sentences
-    numbered_pattern = re.compile(r'^\d+\.\s')
-    # Content that starts with a connector, lowercase, or trailing fragment
-    fragment_pattern = re.compile(r'^[,]\s|^[a-z]')
-
-    clean = text.strip()
-    if not clean or len(clean) < min_len:
-        return None
-    # Skip if it starts with a fragment (comma, lowercase — continuation of prior text)
-    if fragment_pattern.match(clean):
-        return None
-
-    # Try to find a complete sentence
-    for sep in ('.', '!', '?'):
-        for candidate in clean.split(sep):
-            candidate = candidate.strip()
-            if not candidate:
-                continue
-            if numbered_pattern.match(candidate):
-                continue
-            if len(candidate) >= min_len and not abbr_pattern.search(candidate):
-                # Skip if candidate is a filler/timing fragment
-                if re.match(r'^(Worked for|Took|Done in|Finished in|Completed in)', candidate, re.IGNORECASE):
-                    continue
-                return (candidate + sep)[:200]
-    # Fallback: first N characters that form a complete thought
-    fallback = clean[:100].rstrip(',').strip()
-    if len(fallback) >= min_len:
-        # Skip filler fallbacks
-        if re.match(r'^(Worked for|Took|Done in|Finished in|Completed in)', fallback, re.IGNORECASE):
-            return None
-        return fallback
-    return None
+    # Inline code
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # Bold/italic (must handle ** before *)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'\1', text)
+    text = re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', r'\1', text)
+    # Links
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # Headers
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # List markers
+    text = re.sub(r'^[\s]*[-*+]\s+', '', text, flags=re.MULTILINE)
+    # Horizontal rules
+    text = re.sub(r'\n-{2,}\n', '\n', text)
+    # Code blocks
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    # Collapse excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 # ── Task Processor ──────────────────────────────────────────────────────
@@ -1774,17 +1753,14 @@ class TaskProcessor:
                 pass
 
         if response_text:
-            # Emit a natural completion summary (no labels, no prefixes)
+            # Keepalive context already updated during streaming in _call_llm.
+            # All content was emitted as paragraph-sized chunks during streaming
+            # (including the final flush). No need to re-emit here; just update
+            # the keepalive context for any post-processing that follows.
             if tracker:
-                # Show what the response actually says — first sentence as milestone
-                first_bit = _extract_first_sentence(response_text.strip())
-                if first_bit and len(first_bit) > 15:
-                    # Map to a natural, label-free progress update
-                    snippet = first_bit[:200]
-                    tracker._keepalive_ctx = snippet
-                    await tracker.progress(snippet)
-                else:
-                    await tracker.progress("Processing complete — response generated")
+                clean = _strip_markdown(response_text)
+                if clean:
+                    tracker._keepalive_ctx = clean[:200]
 
             await self.linear.send_response(session_id, response_text)
             # Task complete — move to "In Review" for the user
@@ -1922,6 +1898,7 @@ class TaskProcessor:
         last_thought_time = 0.0
         known_findings: set[str] = set()
         _last_checked_len = 0  # Track content already scanned for findings
+        _last_emitted_pos = 0  # Track position of last emitted sentence
 
         for attempt in range(2):
             start = time.monotonic()
@@ -2042,35 +2019,63 @@ class TaskProcessor:
                             if content:
                                 accumulated += content
 
-                            # Emit periodic discovery or in-progress during long streams
+                            # Emit periodic progress during long streams
                             now = time.monotonic()
                             if session_id and content and now - last_thought_time > 1.0:
-                                new_content = accumulated[_last_checked_len:]
                                 _last_checked_len = len(accumulated)
-                                # Stream raw content as it's generated — no keyword scanning,
-                                # no prefixes, no labels. Just show what Hermes is writing.
-                                if new_content and tracker:
-                                    # Use natural first sentence as persistent progress
-                                    sentence = _extract_first_sentence(new_content)
-                                    if sentence:
-                                        await tracker.progress(sentence[:200])
-                                    else:
-                                        # Update keepalive context so background timer says something relevant
-                                        snippet = new_content.strip()[:120].rstrip(",").strip()
-                                        if len(snippet) >= 10:
-                                            tracker._keepalive_ctx = snippet[:100]
-                                else:
-                                    # No new content — use keepalive context from background task
-                                    display = tracker.keepalive_context() if tracker else "Working on it..."
-                                    if len(display) < 5:
-                                        display = "Working on it..."
-                                    await self.linear.create_activity(
-                                        session_id,
-                                        ActivityType.thought,
-                                        body=display,
-                                        ephemeral=True,
-                                    )
+                                if tracker:
+                                    new_block = accumulated[_last_emitted_pos:]
+                                    if len(new_block) >= 60:
+                                        # Skip leading newlines (leftover from previous emissions)
+                                        lead_nl = len(new_block) - len(new_block.lstrip('\n'))
+                                        if lead_nl:
+                                            _last_emitted_pos += lead_nl
+                                            new_block = new_block[lead_nl:]
+
+                                        # Priority: emit complete paragraphs (separated by \n\n).
+                                        # This gives Cursor-style paragraph-sized chunks.
+                                        para_end = new_block.find('\n\n')
+                                        if para_end > 0:
+                                            to_emit = new_block[:para_end]
+                                            block = _strip_markdown(to_emit)
+                                            if block:
+                                                _last_emitted_pos += para_end + 2
+                                                await tracker.progress(block[:500])
+                                        # Fallback: un-emitted text is long with no paragraph break
+                                        elif len(new_block) >= 300:
+                                            for sep in ('. ', '! ', '? '):
+                                                idx = new_block.rfind(sep, 100, 280)
+                                                if idx > 0:
+                                                    to_emit = new_block[:idx + 1]
+                                                    block = _strip_markdown(to_emit)
+                                                    if block:
+                                                        _last_emitted_pos += idx + 1
+                                                        await tracker.progress(block[:500])
+                                                    break
+                                            else:
+                                                # Last resort: break at space
+                                                idx = new_block.rfind(' ', 60, 250)
+                                                if idx > 0:
+                                                    block = _strip_markdown(new_block[:idx])
+                                                    if block:
+                                                        _last_emitted_pos += idx
+                                                        await tracker.progress(block[:500])
+                                    # Update keepalive context (strip markdown for clean keepalive thoughts)
+                                    snippet = new_block.strip()[:100]
+                                    if snippet:
+                                        tracker._keepalive_ctx = _strip_markdown(snippet)
                                 last_thought_time = now
+
+                        # Final flush: emit remaining un-emitted content after stream ends
+                        if tracker and _last_emitted_pos < len(accumulated):
+                            remaining = accumulated[_last_emitted_pos:]
+                            if remaining.strip():
+                                block = _strip_markdown(remaining)
+                                if block:
+                                    # Bypass rate limiter to ensure final progress goes through
+                                    tracker.last_emit = 0.0
+                                    _last_emitted_pos = len(accumulated)
+                                    await tracker.progress(block[:500])
 
                 elapsed = time.monotonic() - start
                 result = accumulated.strip() if accumulated else None
