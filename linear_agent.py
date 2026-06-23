@@ -1094,9 +1094,9 @@ class DiscoveryTracker:
     activity_count: int = 0
     _keepalive_ctx: str = ""
 
-    MIN_ACTIVITY_INTERVAL: float = 1.5
+    MIN_ACTIVITY_INTERVAL: float = 0.8
     """Minimum seconds between any activity emission."""
-    MILESTONE_INTERVAL: float = 3.0
+    MILESTONE_INTERVAL: float = 1.5
     """Minimum seconds between persistent (non-ephemeral) milestone activities."""
 
     async def found(self, detail: str) -> bool:
@@ -2032,7 +2032,7 @@ class TaskProcessor:
 
                             # Emit periodic discovery or in-progress during long streams
                             now = time.monotonic()
-                            if session_id and content and now - last_thought_time > 3.0:
+                            if session_id and content and now - last_thought_time > 1.0:
                                 new_content = accumulated[_last_checked_len:]
                                 _last_checked_len = len(accumulated)
                                 # Stream raw content as it's generated — no keyword scanning,
