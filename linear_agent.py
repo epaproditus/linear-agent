@@ -1235,18 +1235,30 @@ class ProgressQueueWorker:
                 pass
 
     async def _run(self) -> None:
-        """Internal: consume the queue and pass to tracker.progress()."""
+        """Internal: consume the queue and POST to Linear directly.
+
+        Calls ``_do_emit`` directly (not ``tracker.progress()``) to
+        avoid the redundant ``create_task`` wrapper in ``_emit()``.
+        Since this worker already runs as a background task, it can
+        simply await the HTTP POST — no additional indirection needed.
+        Rate-limiting keeps Linear API load manageable.
+        """
+        last_emit = 0.0
         try:
             while True:
                 text = await self._queue.get()
                 if self._tracker:
-                    try:
-                        await self._tracker.progress(text)
-                    except Exception:
-                        log.warning(
-                            "ProgressQueueWorker: progress() failed",
-                            exc_info=True,
-                        )
+                    # Rate-limit: at most one POST per interval
+                    now = time.monotonic()
+                    if now - last_emit >= self._tracker.MILESTONE_INTERVAL:
+                        last_emit = now
+                        try:
+                            await self._tracker._do_emit(text[:500], ephemeral=False)
+                        except Exception:
+                            log.warning(
+                                "ProgressQueueWorker: _do_emit failed",
+                                exc_info=True,
+                            )
                 self._queue.task_done()
         except asyncio.CancelledError:
             pass
