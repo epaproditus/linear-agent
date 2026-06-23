@@ -597,7 +597,7 @@ class LinearClient:
         return await self.create_activity(
             session_id,
             ActivityType.thought,
-            body=message or "🤖 Hermes agent here! Processing the issue...",
+            body=message or "Hermes agent here. Processing the issue...",
             ephemeral=True,
         )
 
@@ -1348,7 +1348,7 @@ class TaskProcessor:
             if not issue:
                 await self.linear.send_error(
                     session_id,
-                    f"❌ Could not fetch issue {session.issue_identifier}.",
+                    f"Could not fetch issue {session.issue_identifier}.",
                 )
                 return
 
@@ -1392,7 +1392,7 @@ class TaskProcessor:
             log.exception("Error processing session %s", session_id)
             await self.linear.send_error(
                 session_id,
-                f"❌ An error occurred while processing this issue:\n```\n{e}\n```",
+                f"An error occurred while processing this issue:\n```\n{e}\n```",
             )
 
     def build_llm_prompt(
@@ -1623,9 +1623,9 @@ class TaskProcessor:
             session_id,
             "Delegating to coding agent",
             identifier,
-            f"🧑‍💻 Spinning up **{settings.coding_agent.title()} Code** to work on "
+            f"Spinning up **{settings.coding_agent.title()} Code** to work on "
             f"**{identifier}**...\n"
-            f"{'🔗 Child issue: ' + child_ref if child_ref else ''}",
+            f"{'Child issue: ' + child_ref if child_ref else ''}",
         )
 
         # 2. Include user's message as custom subagent instructions
@@ -1652,12 +1652,12 @@ class TaskProcessor:
 
             # 4. Post results as comment on parent issue
             comment_body = (
-                f"✅ **{settings.coding_agent.title()} Code** completed work on "
+                f"**{settings.coding_agent.title()} Code** completed work on "
                 f"**{identifier}**:\n\n```\n{output[:3000]}\n```\n\n"
                 f"*(Full output available in agent session)*"
             )
             if child_ref:
-                comment_body += f"\n🔗 Review child issue: {child_ref}"
+                comment_body += f"\nReview child issue: {child_ref}"
             await self.linear.comment(issue_id, comment_body)
 
             await self.linear.send_action(
@@ -1682,20 +1682,20 @@ class TaskProcessor:
 
             await self.linear.send_response(
                 session_id,
-                f"✅ **Done!** {settings.coding_agent.title()} Code finished "
+                f"**Done!** {settings.coding_agent.title()} Code finished "
                 f"working on **{identifier}**.\n"
-                f"{'🔗 Review changes in child issue: ' + child_ref if child_ref else ''}",
+                f"{'Review changes in child issue: ' + child_ref if child_ref else ''}",
             )
 
         elif result["error"]:
             await self.linear.send_error(
                 session_id,
-                f"❌ Coding agent failed for **{identifier}**:\n```\n{result['error']}\n```",
+                f"Coding agent failed for **{identifier}**:\n```\n{result['error']}\n```",
             )
             if child_issue:
                 await self.linear.comment(
                     child_issue["id"],
-                    f"❌ Coding agent failed.\n```\n{result['error'][:2000]}\n```",
+                    f"Coding agent failed.\n```\n{result['error'][:2000]}\n```",
                 )
 
     async def _handle_analysis(
@@ -2072,7 +2072,7 @@ class TaskProcessor:
                     await self.linear.create_activity(
                         session_id,
                         ActivityType.thought,
-                        body="✅ Processing complete — generating response...",
+                        body="Processing complete -- generating response...",
                         ephemeral=True,
                     )
 
@@ -2386,7 +2386,7 @@ class AgentWebhookHandler:
                 try:
                     await self.linear.send_error(
                         session.session_id,
-                        f"❌ Internal error: {e}",
+                        f"Internal error: {e}",
                     )
                 except Exception:
                     log.exception("Failed to send error activity")
