@@ -1,0 +1,1 @@
+cd /home/abe/linear-agent && git add docs/progress-visibility.md && git commit -m "docs: remove stale Still: prefix references from progress-visibility.md" && git push

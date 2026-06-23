@@ -1263,85 +1263,7 @@ def extract_discovery(tool_name: str, args: dict, result: Any) -> str | None:
         return None
 
 
-# ── LLM Finding Extraction ─────────────────────────────────────
-
-
-_FINDING_PATTERNS = re.compile(
-    r"(?:"
-    r"Found(?: the| a| that|:)|"
-    r"Identified(?: the| a| that|:)|"
-    r"Decided(?: to| that|:)|"
-    r"Created(?: the| a|:)|"
-    r"Verified(?: that| the|:)|"
-    r"Root cause(?: is|:)|"
-    r"The issue(?: is|:)|"
-    r"The problem(?: is|:)|"
-    r"Going with|"
-    r"Discovered(?: that|:)|"
-    r"Confirmed(?: that|:)|"
-    r"Realized(?: that|:)|"
-    r"Noticed(?: that|:)|"
-    r"It looks like|"
-    r"I can see that|"
-    r"I found|"
-    r"I identified|"
-    r"I decided|"
-    r"The key finding|"
-    r"This means|"
-    r"Turns out|"
-    r"After investigating|"
-    r"Investigation revealed|"
-    r"Analysis show"
-    r")",
-    re.IGNORECASE,
-)
-
-# Fallback: simple meaningful sentence patterns (non-keyword)
-_FINDING_FALLBACK = re.compile(
-    r"^(?:the |this |it |there |we |i )"
-    r"(?:is|was|has|have|contains|shows|reveals|indicates|suggests|requires|needs|uses|spans|covers|includes|produces|extracts|handles|provides|takes|runs|implements)"
-    r"\b",
-    re.IGNORECASE,
-)
-
-
-def extract_llm_finding(accumulated: str, known_findings: set[str]) -> str | None:
-    """Check accumulated LLM output for a new finding statement.
-
-    Scans lines in reverse (most recent first) for:
-    1. Explicit finding keywords (Found:, Identified:, etc.)
-    2. Discovery-like natural language sentences (fallback)
-    Returns the first complete statement not seen before, or None.
-    """
-    lines = accumulated.split("\n")
-    for line in reversed(lines):
-        stripped = line.strip()
-        if not stripped or len(stripped) < 10:
-            continue
-        # Level 1: explicit keyword prefix
-        if _FINDING_PATTERNS.search(stripped):
-            finding = _truncate_finding(stripped)
-            if finding not in known_findings:
-                return finding
-        # Level 2: meaningful sentence about code/issue state
-        if _FINDING_FALLBACK.match(stripped):
-            finding = _truncate_finding(stripped)
-            if finding not in known_findings:
-                return finding
-    return None
-
-
-def _truncate_finding(text: str, max_len: int = 200) -> str:
-    """Clean and truncate a finding statement."""
-    text = text.rstrip(".").strip()
-    if len(text) > max_len:
-        # Try to break at sentence boundary
-        truncated = text[:max_len]
-        last_period = truncated.rfind(".")
-        if last_period > 20:
-            return truncated[:last_period + 1]
-        return truncated + "..."
-    return text
+# ── LLM Text Streaming ────────────────────────────────────────
 
 
 def _extract_first_sentence(text: str, min_len: int = 20) -> str | None:
@@ -1380,28 +1302,6 @@ def _extract_first_sentence(text: str, min_len: int = 20) -> str | None:
     if len(fallback) >= min_len:
         return fallback
     return None
-
-
-async def _route_and_emit_finding(
-    finding: str, tracker: DiscoveryTracker, known_findings: set[str],
-) -> None:
-    """Route a finding string to the right discovery kind and emit.
-
-    Strips the keyword prefix (Found:, Identified:, etc.) so the body
-    reads as natural prose — cursor-style.
-    """
-    # Strip the keyword prefix for natural reading
-    stripped = re.sub(
-        r'^(Found|Identified|Decided|Created|Verified|Root cause|The issue|The problem|'
-        r'Going with|Discovered|Confirmed|Realized|Noticed|'
-        r'It looks like|I can see that|I found|I identified|I decided|'
-        r'The key finding|This means|Turns out|After investigating|'
-        r'Investigation revealed|Analysis show)\s*[:.\s]\s*',
-        '', finding, flags=re.IGNORECASE,
-    )
-    body = stripped.strip() or finding
-    known_findings.add(finding)
-    await tracker.progress(body[:200])
 
 
 # ── Task Processor ──────────────────────────────────────────────────────
@@ -2133,13 +2033,10 @@ class TaskProcessor:
                             if session_id and content and now - last_thought_time > 3.0:
                                 new_content = accumulated[_last_checked_len:]
                                 _last_checked_len = len(accumulated)
-                                # Level 1: explicit keyword finding (high-signal milestone)
-                                finding = extract_llm_finding(accumulated, known_findings)
-                                if finding and tracker:
-                                    await _route_and_emit_finding(finding, tracker, known_findings)
-                                elif new_content and tracker:
-                                    # Use the first sentence of new content as ephemeral in-progress
-                                    # (no "Found:" prefix — reads naturally like cursor)
+                                # Stream raw content as it's generated — no keyword scanning,
+                                # no prefixes, no labels. Just show what Hermes is writing.
+                                if new_content and tracker:
+                                    # Use natural first sentence as ephemeral progress
                                     sentence = _extract_first_sentence(new_content, min_len=10)
                                     if sentence:
                                         await tracker.in_progress(sentence[:200])
