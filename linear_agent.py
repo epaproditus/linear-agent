@@ -1266,12 +1266,13 @@ def extract_discovery(tool_name: str, args: dict, result: Any) -> str | None:
 # ── LLM Text Streaming ────────────────────────────────────────
 
 
-def _extract_first_sentence(text: str, min_len: int = 20) -> str | None:
+def _extract_first_sentence(text: str, min_len: int = 30) -> str | None:
     """Extract the first meaningful sentence from text for progress display.
 
     Finds the first complete sentence (ending with . ! or ?) that's at least
     *min_len* characters. Handles common abbreviations (e.g., 'Dr.', 'Mr.',
-    'vs.', 'etc.') to avoid false sentence boundaries.
+    'vs.', 'etc.) to avoid false sentence boundaries.
+    Skips fragments that start with lowercase, commas, or common filler words.
     Returns None if no suitable sentence is found.
     """
     # Abbreviations that should not end a sentence
@@ -1282,9 +1283,14 @@ def _extract_first_sentence(text: str, min_len: int = 20) -> str | None:
     )
     # Numbered items (e.g., "1.", "2.") are not sentences
     numbered_pattern = re.compile(r'^\d+\.\s')
+    # Content that starts with a connector, lowercase, or trailing fragment
+    fragment_pattern = re.compile(r'^[,]\s|^[a-z]')
 
     clean = text.strip()
     if not clean or len(clean) < min_len:
+        return None
+    # Skip if it starts with a fragment (comma, lowercase — continuation of prior text)
+    if fragment_pattern.match(clean):
         return None
 
     # Try to find a complete sentence
@@ -1296,10 +1302,16 @@ def _extract_first_sentence(text: str, min_len: int = 20) -> str | None:
             if numbered_pattern.match(candidate):
                 continue
             if len(candidate) >= min_len and not abbr_pattern.search(candidate):
+                # Skip if candidate is a filler/timing fragment
+                if re.match(r'^(Worked for|Took|Done in|Finished in|Completed in)', candidate, re.IGNORECASE):
+                    continue
                 return (candidate + sep)[:200]
     # Fallback: first N characters that form a complete thought
     fallback = clean[:100].rstrip(',').strip()
     if len(fallback) >= min_len:
+        # Skip filler fallbacks
+        if re.match(r'^(Worked for|Took|Done in|Finished in|Completed in)', fallback, re.IGNORECASE):
+            return None
         return fallback
     return None
 
@@ -1765,7 +1777,7 @@ class TaskProcessor:
             # Emit a natural completion summary (no labels, no prefixes)
             if tracker:
                 # Show what the response actually says — first sentence as milestone
-                first_bit = _extract_first_sentence(response_text.strip(), min_len=15)
+                first_bit = _extract_first_sentence(response_text.strip())
                 if first_bit and len(first_bit) > 15:
                     # Map to a natural, label-free progress update
                     snippet = first_bit[:200]
@@ -2039,7 +2051,7 @@ class TaskProcessor:
                                 # no prefixes, no labels. Just show what Hermes is writing.
                                 if new_content and tracker:
                                     # Use natural first sentence as persistent progress
-                                    sentence = _extract_first_sentence(new_content, min_len=10)
+                                    sentence = _extract_first_sentence(new_content)
                                     if sentence:
                                         await tracker.progress(sentence[:200])
                                     else:
