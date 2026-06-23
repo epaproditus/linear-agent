@@ -2001,13 +2001,15 @@ class TaskProcessor:
                                     # Emit action activity for the tool call
                                     fn_name = tool_calls_map[idx]["function"]["name"]
                                     if fn_name and session_id and idx == len(tool_calls_map) - 1:
-                                        await self.linear.create_activity(
-                                            session_id,
-                                            ActivityType.action,
-                                            body=f"**{fn_name}** {(', '.join(f'{k}={v}' for k, v in json.loads(tool_calls_map[idx]['function']['arguments'] or '{}').items()))[:100]}",
-                                            action_label=fn_name,
-                                            action_param=tool_calls_map[idx]["function"]["arguments"][:100],
-                                            ephemeral=True,
+                                        asyncio.create_task(
+                                            self.linear.create_activity(
+                                                session_id,
+                                                ActivityType.action,
+                                                body=f"**{fn_name}** {(', '.join(f'{k}={v}' for k, v in json.loads(tool_calls_map[idx]['function']['arguments'] or '{}').items()))[:100]}",
+                                                action_label=fn_name,
+                                                action_param=tool_calls_map[idx]["function"]["arguments"][:100],
+                                                ephemeral=True,
+                                            )
                                         )
                                         log.info("Stream: tool call %s", fn_name)
                                         last_thought_time = time.monotonic()
