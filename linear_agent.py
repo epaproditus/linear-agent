@@ -1127,6 +1127,15 @@ class DiscoveryTracker:
         self._keepalive_ctx = description
         return await self._emit("", description, ephemeral=True)
 
+    async def progress(self, detail: str) -> bool:
+        """Emit a persistent progress update without a kind label.
+
+        Use this for tool-completion summaries and other intermediate
+        results that don't warrant a 'found'/'identified' category.
+        Produces natural text like cursor's output.
+        """
+        return await self._emit("", detail, ephemeral=False)
+
     async def _emit(self, kind: str, detail: str, ephemeral: bool) -> bool:
         """Rate-limited activity emission. Skips if interval hasn't elapsed.
 
@@ -1144,7 +1153,9 @@ class DiscoveryTracker:
         self.last_emit = now
         self.activity_count += 1
 
-        body = f"{kind}: {detail}" if kind else detail
+        # Use detail directly as body — no prefix.
+        # The action label (kind) is sent via label= for Linear's action type system.
+        body = detail
         try:
             return await self.linear.send_action(
                 self.session_id,
@@ -1373,18 +1384,23 @@ def _extract_first_sentence(text: str, min_len: int = 20) -> str | None:
 async def _route_and_emit_finding(
     finding: str, tracker: DiscoveryTracker, known_findings: set[str],
 ) -> None:
-    """Route a finding string to the right discovery kind and emit."""
-    if finding.startswith("Identified"):
-        await tracker.identified(finding)
-    elif finding.startswith("Decided"):
-        await tracker.decided(finding)
-    elif finding.startswith("Created"):
-        await tracker.created(finding)
-    elif finding.startswith("Verified"):
-        await tracker.verified(finding)
-    else:
-        await tracker.found(finding)
+    """Route a finding string to the right discovery kind and emit.
+
+    Strips the keyword prefix (Found:, Identified:, etc.) so the body
+    reads as natural prose — cursor-style.
+    """
+    # Strip the keyword prefix for natural reading
+    stripped = re.sub(
+        r'^(Found|Identified|Decided|Created|Verified|Root cause|The issue|The problem|'
+        r'Going with|Discovered|Confirmed|Realized|Noticed|'
+        r'It looks like|I can see that|I found|I identified|I decided|'
+        r'The key finding|This means|Turns out|After investigating|'
+        r'Investigation revealed|Analysis show)\s*[:.\s]\s*',
+        '', finding, flags=re.IGNORECASE,
+    )
+    body = stripped.strip() or finding
     known_findings.add(finding)
+    await tracker.progress(body[:200])
 
 
 # ── Task Processor ──────────────────────────────────────────────────────
@@ -1826,8 +1842,8 @@ class TaskProcessor:
 
         # Initialize DiscoveryTracker for result-oriented progress updates
         tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
-        # Set initial keepalive context so the background timer emits meaningful messages
-        await tracker.in_progress("analyzing the issue and planning next steps")
+        # Set initial context — cursor-style: "Examining issue PLY-41"
+        await tracker.in_progress(f"Examining issue {identifier}")
 
         # Start background keepalive to continue sending activity during long LLM calls
         keepalive_task = asyncio.create_task(
@@ -1845,13 +1861,15 @@ class TaskProcessor:
                 pass
 
         if response_text:
-            # Extract key findings from the response and emit
+            # Emit a natural response-started summary
             if tracker:
-                await tracker.created(f"Response generated for {identifier}")
-                # Try to extract first finding sentence from response
+                # Extract first real finding from response (stripped of keywords)
                 resp_finding = extract_llm_finding(response_text, set())
                 if resp_finding and len(resp_finding) > 15:
-                    await tracker.found(resp_finding)
+                    # Route through the prefix-stripping path
+                    await _route_and_emit_finding(resp_finding, tracker, set())
+                else:
+                    await tracker.progress("Processing complete — response generated")
 
             await self.linear.send_response(session_id, response_text)
             # Task complete — move to "In Review" for the user
@@ -1871,33 +1889,33 @@ class TaskProcessor:
             )
 
     def _make_tool_discovery(self, tool_name: str, args: dict) -> str | None:
-        """Generate a discovery statement from a tool call name and arguments.
+        """Generate a natural summary from tool name and args (fallback).
 
-        Runs without executing the tool (works from the stream metadata alone).
-        For richer extraction, use _execute_tool_locally + extract_discovery().
+        Used when local execution fails or produces no result. Produces
+        conversational past-tense summaries that read like cursor output.
         """
         if tool_name == "read_file":
             path = args.get("path", "")
             if path:
-                return f"Investigating {path}"
+                return f"Read {os.path.basename(path.rstrip('/'))}"
         elif tool_name == "search_files":
             pattern = args.get("pattern", "")
             search_path = args.get("path", ".")
             if pattern:
-                return f"Searching for '{pattern[:40]}' in {search_path}"
+                return f"Searched for '{pattern[:40]}' in {search_path}"
         elif tool_name == "web_search":
             query = args.get("query", "")
             if query:
-                return f"Searching web for '{query[:50]}'"
+                return f"Searched web for '{query[:50]}'"
         elif tool_name == "web_extract":
             urls = args.get("urls", [])
             if urls:
-                return f"Fetching {urls[0][:60]}"
+                return f"Fetched content from {urls[0][:60]}"
         elif tool_name == "execute_code":
             code = args.get("code", "")
             preview = code[:50].replace("\n", " ") if code else ""
             if preview:
-                return f"Running code: {preview}"
+                return f"Ran code: {preview}"
         return None
 
     async def _execute_tool_locally(
@@ -2097,9 +2115,10 @@ class TaskProcessor:
                                         if not discovery:
                                             discovery = self._make_tool_discovery(fn_name, fn_args)
                                         if discovery:
-                                            # Found kind for tool results
+                                            # Natural progress update (cursor-style)
                                             known_findings.add(discovery)
-                                            await tracker.found(discovery)
+                                            tracker._keepalive_ctx = discovery[:100]
+                                            await tracker.progress(discovery)
                                 tool_calls_map.clear()
                                 last_thought_time = time.monotonic()
 
@@ -2113,15 +2132,21 @@ class TaskProcessor:
                             if session_id and content and now - last_thought_time > 3.0:
                                 new_content = accumulated[_last_checked_len:]
                                 _last_checked_len = len(accumulated)
-                                # Try to extract a finding statement first (high-signal milestone)
+                                # Level 1: explicit keyword finding (high-signal milestone)
                                 finding = extract_llm_finding(accumulated, known_findings)
                                 if finding and tracker:
                                     await _route_and_emit_finding(finding, tracker, known_findings)
                                 elif new_content and tracker:
-                                    # Emit latest content as persistent milestone — show progress always
-                                    display = new_content.strip()[:200]
-                                    if len(display) >= 5:
-                                        await tracker.found(display)
+                                    # Use the first sentence of new content as ephemeral in-progress
+                                    # (no "Found:" prefix — reads naturally like cursor)
+                                    sentence = _extract_first_sentence(new_content, min_len=10)
+                                    if sentence:
+                                        await tracker.in_progress(sentence[:200])
+                                    else:
+                                        # Update keepalive context so background timer says something relevant
+                                        snippet = new_content.strip()[:120].rstrip(",").strip()
+                                        if len(snippet) >= 10:
+                                            tracker._keepalive_ctx = snippet[:100]
                                 else:
                                     # No new content — use keepalive context from background task
                                     display = tracker.keepalive_context() if tracker else "Still working on it..."
