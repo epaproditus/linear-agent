@@ -571,7 +571,7 @@ class LinearClient:
         content: dict[str, Any] = {"type": activity_type.value}
 
         if activity_type == ActivityType.action:
-            content["action"] = action_label or "Processing"
+            content["action"] = action_label if action_label else ""
             content["parameter"] = action_param or ""
             content["body"] = body
             if action_result:
@@ -1153,13 +1153,13 @@ class DiscoveryTracker:
         self.last_emit = now
         self.activity_count += 1
 
-        # Use detail directly as body — no prefix.
-        # The action label (kind) is sent via label= for Linear's action type system.
+        # Use detail directly as body — no prefix, no label.
+        # The action label is set to empty so Linear doesn't display a category prefix.
         body = detail
         try:
             return await self.linear.send_action(
                 self.session_id,
-                label=kind or "progress",
+                label="",
                 param=detail[:200],
                 body=body,
                 ephemeral=ephemeral,
@@ -1762,13 +1762,15 @@ class TaskProcessor:
                 pass
 
         if response_text:
-            # Emit a natural response-started summary
+            # Emit a natural completion summary (no labels, no prefixes)
             if tracker:
-                # Extract first real finding from response (stripped of keywords)
-                resp_finding = extract_llm_finding(response_text, set())
-                if resp_finding and len(resp_finding) > 15:
-                    # Route through the prefix-stripping path
-                    await _route_and_emit_finding(resp_finding, tracker, set())
+                # Show what the response actually says — first sentence as milestone
+                first_bit = _extract_first_sentence(response_text.strip(), min_len=15)
+                if first_bit and len(first_bit) > 15:
+                    # Map to a natural, label-free progress update
+                    snippet = first_bit[:200]
+                    tracker._keepalive_ctx = snippet
+                    await tracker.progress(snippet)
                 else:
                     await tracker.progress("Processing complete — response generated")
 
