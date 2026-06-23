@@ -1101,23 +1101,23 @@ class DiscoveryTracker:
 
     async def found(self, detail: str) -> bool:
         """Emit a discovery: something located during investigation."""
-        return await self._emit("Found", detail, ephemeral=False)
+        return await self.progress(detail)
 
     async def identified(self, detail: str) -> bool:
         """Emit a discovery: a gap, pattern, or relationship recognized."""
-        return await self._emit("Identified", detail, ephemeral=False)
+        return await self.progress(detail)
 
     async def decided(self, detail: str) -> bool:
         """Emit a discovery: a choice made between alternatives."""
-        return await self._emit("Decided", detail, ephemeral=False)
+        return await self.progress(detail)
 
     async def created(self, detail: str) -> bool:
         """Emit a discovery: an artifact produced."""
-        return await self._emit("Created", detail, ephemeral=False)
+        return await self.progress(detail)
 
     async def verified(self, detail: str) -> bool:
         """Emit a discovery: a validation completed."""
-        return await self._emit("Verified", detail, ephemeral=False)
+        return await self.progress(detail)
 
     async def in_progress(self, description: str) -> bool:
         """Emit an ephemeral in-progress indicator.
