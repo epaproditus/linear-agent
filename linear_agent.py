@@ -1845,12 +1845,6 @@ class TaskProcessor:
             if tracker:
                 await tracker.flush()
 
-            # Update keepalive context for any post-processing that follows.
-            if tracker:
-                clean = _strip_markdown(response_text)
-                if clean:
-                    tracker._keepalive_ctx = clean[:200]
-
             await self.linear.send_response(session_id, response_text)
             # Task complete — move to "In Review" for the user
             if session.action != SessionAction.prompted:
@@ -2101,6 +2095,7 @@ class TaskProcessor:
                                             # Natural progress update (cursor-style)
                                             known_findings.add(discovery)
                                             tracker._keepalive_ctx = discovery[:100]
+                                            tracker._skip_texts.add(discovery)
                                             await progress_worker.put(discovery)
                                 tool_calls_map.clear()
 
