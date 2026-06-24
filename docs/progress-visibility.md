@@ -17,9 +17,10 @@ timeline updates show what Hermes is doing without duplicating the answer.
 There are three sources of progress updates:
 
 1. **Hermes tool progress** — As Hermes runs tools during its agent loop,
-   each `hermes.tool.progress` event is converted to natural text (e.g.
-   "git remote -v", "Searching web for 'PLY-41 discovery tracker'") and
-   emitted to Linear via DiscoveryTracker.
+   each `hermes.tool.progress` event is beautified into short prose
+   (e.g. `Working in linear-agent`, `Checked recent git history`,
+   `Read linear_agent.py`) — raw code blobs and inconsistent `**bold**`
+   from Hermes labels are never shown verbatim.
 
 2. **Content-drought keepalive** — During long thinking phases with no
    tool or content tokens, contextual keepalive text fires every ~5 seconds
@@ -34,9 +35,10 @@ into the timeline.
 
 ```
 [+1s]  Examining issue PLY-41
-[+6s]  git remote -v
-[+9s]  grep -r DiscoveryTracker linear_agent.py
-[+12s] Reading linear_agent.py
+[+3s]  Working in `linear-agent`
+[+6s]  Checked recent git history (last 20 commits)
+[+9s]  Read `linear_agent.py`
+[+12s] Found `format_hermes_tool_progress`
 [+30s] (final response)
 ```
 

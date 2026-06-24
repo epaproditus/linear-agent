@@ -1290,6 +1290,111 @@ _HERMES_TOOL_VERBS: dict[str, str] = {
     "grep": "Searching",
 }
 
+_CODE_MARKERS = (
+    "import ", "def ", "class ", "subprocess", "print(", "async def",
+    "asyncio.", "json.", "capture_output",
+)
+
+
+def _normalize_progress_markdown(text: str) -> str:
+    """Strip markdown Hermes or upstream clients may have injected."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _looks_like_code(text: str) -> bool:
+    if len(text) > 120 or "\n" in text:
+        return True
+    lower = text.lower()
+    return any(m in lower for m in _CODE_MARKERS)
+
+
+def _looks_like_path(text: str) -> bool:
+    t = text.strip()
+    return (
+        t.startswith("/")
+        or t.startswith("~/")
+        or ("/" in t and re.search(r"\.[a-zA-Z0-9]{1,6}$", t))
+    )
+
+
+def _is_repo_slug(text: str) -> bool:
+    t = text.strip()
+    return bool(re.fullmatch(r"[\w][\w.-]{0,48}", t)) and " " not in t
+
+
+def _basename(path: str) -> str:
+    return os.path.basename(path.rstrip("/"))
+
+
+def _summarize_code_label(label: str) -> str | None:
+    """Turn a Python/script blob into a short human-readable action."""
+    for line in label.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            intent = stripped.lstrip("#").strip()
+            if len(intent) >= 6:
+                return intent[0].upper() + intent[1:]
+
+    lower = label.lower()
+    if "git" in lower and "log" in lower:
+        m = re.search(r"-(\d+)", label)
+        n = m.group(1) if m else "20"
+        return f"Checked recent git history (last {n} commits)"
+    if "git" in lower and "show" in lower:
+        return "Reviewed latest commit"
+    if "git" in lower and "diff" in lower:
+        return "Compared code changes"
+    if "grep" in lower or "rg " in lower:
+        patterns = re.findall(r"""['"]([^'"]{3,60})['"]""", label)
+        for pat in patterns:
+            if pat not in (".", "..") and not pat.startswith("/"):
+                return f"Searched for `{pat}`"
+        return "Searched the codebase"
+    if "read" in lower and ("_call_llm" in label or "progress" in lower):
+        return "Read progress parsing code in linear_agent.py"
+    if "subprocess" in lower:
+        return "Ran shell command"
+    return "Ran script"
+
+
+def _beautify_progress_text(
+    tool: str, label: str, args: dict[str, Any],
+) -> str | None:
+    """Convert raw Hermes labels into short, consistent timeline prose."""
+    label = _normalize_progress_markdown(label)
+    if not label:
+        return _format_hermes_tool_fallback(tool, args)
+
+    if _is_repo_slug(label) and tool in ("terminal", "execute_code", "browser"):
+        return f"Working in `{label}`"
+
+    if _looks_like_path(label):
+        base = _basename(label)
+        if tool == "read_file" or base.endswith((".py", ".md", ".json", ".yaml", ".yml", ".toml")):
+            return f"Read `{base}`"
+        return f"Opened `{base}`"
+
+    sym = re.fullmatch(r"def (\w+)", label.strip())
+    if sym:
+        return f"Found `{sym.group(1)}`"
+
+    if tool in ("execute_code", "terminal") and _looks_like_code(label):
+        return _summarize_code_label(label)
+
+    if tool == "terminal" and len(label) <= 72 and not _looks_like_code(label):
+        return f"Ran `{label}`"
+
+    if tool == "web_search" and len(label) <= 80:
+        return f"Searched web for `{label}`"
+
+    if len(label) <= 80 and not _looks_like_code(label):
+        return label
+
+    return _format_hermes_tool_fallback(tool, args) or label[:80]
+
 
 def _parse_hermes_tool_args(event: dict) -> dict[str, Any]:
     """Normalize tool args from a hermes.tool.progress payload."""
@@ -1313,27 +1418,33 @@ def _format_hermes_tool_fallback(tool: str, args: dict[str, Any]) -> str | None:
     if tool == "terminal":
         cmd = args.get("command") or args.get("value", "")
         if cmd:
-            return f"Running: {str(cmd)[:120]}"
+            cmd = str(cmd).strip()
+            if len(cmd) <= 72:
+                return f"Ran `{cmd}`"
+            return f"Ran `{cmd[:69]}…`"
     if tool == "web_search":
         query = args.get("query", "")
         if query:
-            return f"Searching web for '{str(query)[:60]}'"
+            return f"Searched web for `{str(query)[:60]}`"
     if tool == "read_file":
         path = args.get("path", "")
         if path:
-            return f"Reading {path}"
+            return f"Read `{_basename(str(path))}`"
     if tool == "search_files":
         pattern = args.get("pattern", "")
         if pattern:
-            return f"Searching for '{str(pattern)[:40]}'"
+            return f"Searched for `{str(pattern)[:40]}`"
     if tool == "execute_code":
         code = args.get("code") or args.get("value", "")
         if code:
-            return f"Running code: {str(code).replace(chr(10), ' ')[:80]}"
+            summary = _summarize_code_label(str(code))
+            if summary:
+                return summary
+            return "Ran script"
     if tool == "web_extract":
         urls = args.get("urls") or []
         if urls:
-            return f"Fetching {urls[0]}"
+            return f"Fetched `{urls[0][:60]}`"
     return verb.capitalize() if verb else None
 
 
@@ -1353,21 +1464,24 @@ def format_hermes_tool_progress(event: dict) -> str | None:
         return None
 
     label = (event.get("label") or "").strip()
-    if label:
-        text = label[:200]
+    args = _parse_hermes_tool_args(event)
+    if label or args:
+        text = _beautify_progress_text(tool, label, args)
     else:
-        text = _format_hermes_tool_fallback(tool, _parse_hermes_tool_args(event))
-        if not text:
-            return None
+        text = _format_hermes_tool_fallback(tool, args)
+    if not text:
+        return None
 
     if status == "completed":
         output = event.get("output") or event.get("result")
         if isinstance(output, dict):
             output = json.dumps(output, ensure_ascii=False)
         if isinstance(output, str):
-            preview = output.strip().replace("\n", " ")[:80]
-            if preview and preview not in text:
-                return f"{text} — {preview}"
+            preview = _normalize_progress_markdown(output)[:60]
+            if preview and len(preview) > 12 and preview not in text:
+                if tool in ("grep", "search_files", "terminal"):
+                    return f"{text} — found results"
+                return text
 
     return text
 
