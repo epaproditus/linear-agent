@@ -100,6 +100,20 @@ _PLAN_ACTIVE = "inProgress"
 _PLAN_DONE = "completed"
 PLAN_STEP_MAX_LEN = 48
 PLAN_MAX_STEPS = 5
+PLAN_STEP_MAX_WORDS = 6
+
+# Map embedded shell/git commands to short checklist labels.
+_PLAN_COMMAND_LABELS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"git\s+status", re.I), "Check git status"),
+    (re.compile(r"git\s+log", re.I), "Review recent commits"),
+    (re.compile(r"git\s+diff", re.I), "Diff changed files"),
+    (re.compile(r"git\s+show", re.I), "Inspect commit"),
+    (re.compile(r"git\s+branch", re.I), "List branches"),
+    (re.compile(r"git\s+checkout", re.I), "Switch branch"),
+    (re.compile(r"git\s+stash", re.I), "Check stash"),
+    (re.compile(r"pytest|npm test|cargo test", re.I), "Run tests"),
+    (re.compile(r"systemctl|docker compose|docker-compose", re.I), "Check service"),
+]
 
 # ── Rate Limiting ──
 MAX_CONCURRENT_SESSIONS = 10    # Max concurrent LLM session handlers
@@ -1328,9 +1342,55 @@ def _parse_hermes_plan_json(text: str) -> list[str]:
     return []
 
 
-def _shorten_plan_step(text: str, max_len: int = PLAN_STEP_MAX_LEN) -> str:
+def _humanize_plan_step(text: str) -> str:
+    """Turn command-heavy plan text into a short intent label."""
+    t = text.strip()
+    t = t.replace("\\~", "~").replace("\\'", "'").replace('\\"', '"')
+    t = re.sub(r"\\([~`'_\"])", r"\1", t)
+
+    for pattern, label in _PLAN_COMMAND_LABELS:
+        if pattern.search(t):
+            return label
+
+    lower = t.lower()
+    if re.search(r"navigate|cd to|change directory|open (?:the )?(?:repo|project)", lower):
+        if "git" in lower:
+            return "Check repository"
+        return "Open project"
+
+    if re.search(r"\b(?:run|execute)\b", lower) and re.search(
+        r"['\"`]|git |npm |pytest|curl |grep ", lower,
+    ):
+        for pattern, label in _PLAN_COMMAND_LABELS:
+            if pattern.search(t):
+                return label
+        return "Run investigation command"
+
+    # Drop quoted shell snippets and filesystem paths.
+    t = re.sub(r"['\"`][^'\"`]{8,}['\"`]", "", t)
+    t = re.sub(r"(?:~|/)[\w./-]+/?", "", t)
+    t = re.sub(
+        r"\s+(?:with|using|via)\s+(?:the\s+)?(?:command\s+)?['\"`].*?['\"`]",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(
+        r"\b(?:and\s+)?(?:verify|confirm|check)\s+(?:it(?:'s| is)\s+a\s+)?",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", t).strip(" ,;.-")
+
+
+def _shorten_plan_step(
+    text: str,
+    max_len: int = PLAN_STEP_MAX_LEN,
+    max_words: int = PLAN_STEP_MAX_WORDS,
+) -> str:
     """Compress a plan step to a short checklist label."""
-    t = _normalize_progress_markdown(text.strip())
+    t = _humanize_plan_step(_normalize_progress_markdown(text.strip()))
     t = re.sub(
         r"^(?:i will |i'll |we need to |need to |first,? |then,? |next,? )+",
         "",
@@ -1347,6 +1407,9 @@ def _shorten_plan_step(text: str, max_len: int = PLAN_STEP_MAX_LEN) -> str:
     t = re.sub(r"\s+", " ", t).strip(" ,;.-")
     if not t:
         return ""
+    words = t.split()
+    if len(words) > max_words:
+        t = " ".join(words[:max_words])
     if len(t) <= max_len:
         return t[0].upper() + t[1:] if t else t
     cut = t[: max_len - 1].rsplit(" ", 1)[0]
@@ -2057,9 +2120,12 @@ class TaskProcessor:
             f"User request:\n{user_request}\n"
             "\n"
             "Return 3–5 terse checklist steps for this issue.\n"
-            "Each step: max 8 words, imperative, no full sentences.\n"
-            "Style: verb + object — like 'Read linear_agent.py',"
-            " 'Grep hermes.tool.progress', 'Check phase-2 summary'.\n"
+            "Each step: max 6 words, imperative, intent only — not how.\n"
+            "Labels like 'Check git status', 'Review recent commits',"
+            " 'Diff changed files', 'Read linear_agent.py'.\n"
+            "Never include shell commands, flags, paths, tildes, or quoted strings.\n"
+            "Bad: \"Navigate to ~/repo and run 'git status'\".\n"
+            "Good: \"Check git status\".\n"
             "No explanations, sub-clauses, or 'in order to' phrasing.\n"
             "Do not include 'write final answer' — that is implicit.\n"
             "\n"
