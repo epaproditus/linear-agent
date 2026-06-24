@@ -1094,6 +1094,8 @@ class DiscoveryTracker:
     activity_count: int = 0
     _keepalive_ctx: str = ""
     _pending_tasks: list[asyncio.Task] = field(default_factory=list)
+    _skip_texts: set = field(default_factory=set)
+    """Texts already emitted by the tracker; LLM-streamed duplicates are suppressed."""
 
     MIN_ACTIVITY_INTERVAL: float = 0.8
     """Minimum seconds between any activity emission."""
@@ -1126,6 +1128,7 @@ class DiscoveryTracker:
         Updates keepalive context. Replaced by the next ephemeral activity.
         """
         self._keepalive_ctx = description
+        self._skip_texts.add(description)
         return await self._emit("", description, ephemeral=True)
 
     async def progress(self, detail: str) -> bool:
@@ -2137,16 +2140,17 @@ class TaskProcessor:
                                         if para_end > 0:
                                             to_emit = new_block[:para_end]
                                             block = _strip_markdown(to_emit)
-                                            if block:
-                                                _last_emitted_pos += para_end + 2
+                                            if block and len(block) >= 10 and block not in tracker._skip_texts:
                                                 await progress_worker.put(block[:500])
+                                            # Always advance past paragraph + \n\n separator
+                                            _last_emitted_pos += para_end + 2
                                         elif len(new_block) >= 300:
                                             for sep in ('. ', '! ', '? '):
                                                 idx = new_block.rfind(sep, 100, 280)
                                                 if idx > 0:
                                                     to_emit = new_block[:idx + 1]
                                                     block = _strip_markdown(to_emit)
-                                                    if block:
+                                                    if block and block not in tracker._skip_texts:
                                                         _last_emitted_pos += idx + 1
                                                         await progress_worker.put(block[:500])
                                                     break
@@ -2154,7 +2158,7 @@ class TaskProcessor:
                                                 idx = new_block.rfind(' ', 60, 250)
                                                 if idx > 0:
                                                     block = _strip_markdown(new_block[:idx])
-                                                    if block:
+                                                    if block and block not in tracker._skip_texts:
                                                         _last_emitted_pos += idx
                                                         await progress_worker.put(block[:500])
                                     snippet = new_block.strip()[:100]
@@ -2179,7 +2183,7 @@ class TaskProcessor:
                             ):
                                 if tracker:
                                     ctx = tracker.keepalive_context()
-                                    if ctx:
+                                    if ctx and ctx not in tracker._skip_texts:
                                         await progress_worker.put(ctx[:200])
                                 last_drought_time = now
 
@@ -2188,7 +2192,7 @@ class TaskProcessor:
                             remaining = accumulated[_last_emitted_pos:]
                             if remaining.strip():
                                 block = _strip_markdown(remaining)
-                                if block:
+                                if block and block not in tracker._skip_texts:
                                     tracker.last_emit = 0.0
                                     _last_emitted_pos = len(accumulated)
                                     await progress_worker.put(block[:500])
