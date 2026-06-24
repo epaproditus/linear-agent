@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PLY-43 — Linear diff format preview (Prism.js)</title>
+  <link href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css" rel="stylesheet" />
+  <style>
+  :root {
+    --bg: #fafafa;
+    --card: #fff;
+    --border: #e5e5e5;
+    --text: #1a1a1a;
+    --muted: #666;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111;
+      --card: #1a1a1a;
+      --border: #333;
+      --text: #eee;
+      --muted: #aaa;
+    }
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 2rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--muted); margin-bottom: 2rem; font-size: 0.95rem; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  section h2 { font-size: 1.1rem; margin-top: 0; }
+  section p, section li { font-size: 0.95rem; }
+  .note {
+    background: #fff8e6;
+    border-left: 3px solid #f5a623;
+    padding: 0.75rem 1rem;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+  @media (prefers-color-scheme: dark) {
+    .note { background: #2a2418; }
+  }
+  pre[class*="language-"] {
+    border-radius: 6px;
+    font-size: 0.85rem;
+    margin: 0.75rem 0;
+  }
+  .citation pre {
+    background: #f6f8fa;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+  }
+  .verdict { font-weight: 600; }
+  .good { color: #22863a; }
+  .ok { color: #b08800; }
+  .poor { color: #cb2431; }
+  </style>
+</head>
+<body>
+  <h1>PLY-43: Diff format rendering preview</h1>
+  <p class="subtitle">
+    Approximates fenced-code rendering with Prism.js (diff grammar).
+    Linear’s editor supports fenced code blocks with language tags; diff highlighting
+    is expected to behave similarly to GitHub / Prism, though this is not captured from live Linear UI.
+  </p>
+
+  <div class="note">
+    Open this file in a browser to compare formats side by side.
+    Red/green +/- highlighting requires the <code>diff</code> or <code>patch</code> language tag.
+  </div>
+
+  <section>
+    <h2>Format A — <code>diff</code> fenced block <span class="verdict good">Recommended for changes</span></h2>
+    <p>Unified diff excerpt with <code>+</code>/<code>-</code> lines colored green/red.</p>
+    <pre><code class="language-diff">--- a/linear_agent.py
++++ b/linear_agent.py
+@@ -2476,6 +2476,9 @@ class TaskProcessor:
+     async def _finalize_response(self, session_id, draft_text, ...):
++        if not draft_text.strip():
++            return
++
+         if tracker and tracker.tool_progress:
+             finalized = await self._call_llm_finalize(...)</code></pre>
+  </section>
+
+  <section>
+    <h2>Format B — <code>patch</code> fenced block <span class="verdict ok">Acceptable fallback</span></h2>
+    <p>Same content as Format A; Prism treats <code>patch</code> like <code>diff</code> in most renderers.</p>
+    <pre><code class="language-patch">diff --git a/linear_agent.py b/linear_agent.py
+--- a/linear_agent.py
++++ b/linear_agent.py
+@@ -89,7 +89,8 @@
+-- Reference code with citation fences.
++- Reference existing code with citation fences.
++- Show code changes with short diff excerpts.</code></pre>
+  </section>
+
+  <section>
+    <h2>Format C — Plain fenced block <span class="verdict poor">Avoid for diffs</span></h2>
+    <p>No language tag — monospace only, no +/- coloring.</p>
+    <pre><code>     async def _finalize_response(self, session_id, draft_text, ...):
++        if not draft_text.strip():
++            return
++
+         if tracker and tracker.tool_progress:</code></pre>
+  </section>
+
+  <section>
+    <h2>Format D — Cursor citation <code>startLine:endLine:filepath</code> <span class="verdict good">Recommended for references</span></h2>
+    <p>Shows code at a location; Linear renders as a code block (language tag is non-standard). Not a diff view.</p>
+    <div class="citation">
+      <pre>```2476:2482:linear_agent.py
+    async def _finalize_response(self, session_id, draft_text, ...):
+        if not draft_text.strip():
+            return
+
+        if tracker and tracker.tool_progress:
+            finalized = await self._call_llm_finalize(...)
+```</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2>Format E — Summary + diff hybrid <span class="verdict good">Best overall</span></h2>
+    <p>Prose finding + short diff excerpt — matches how users scan Linear agent responses.</p>
+    <p><strong>Finding:</strong> Empty drafts were still rewritten in phase 2.</p>
+    <p><strong>Change</strong> in <code>linear_agent.py</code>:</p>
+    <pre><code class="language-diff">@@ -2476,6 +2476,9 @@
+     async def _finalize_response(self, session_id, draft_text, ...):
++        if not draft_text.strip():
++            return
++
+         if tracker and tracker.tool_progress:</code></pre>
+  </section>
+
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-diff.min.js"></script>
+</body>
+</html>

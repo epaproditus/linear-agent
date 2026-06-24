@@ -86,7 +86,9 @@ Reply style (Linear issue comment — user already saw tool progress on the time
 - Write like a clear technical post: complete sentences, plain language, no jargon padding.
 - Match depth to the question — short questions get short answers.
 - Open with the finding, answer, or decision — not setup or process narration.
-- Reference code with citation fences: ```startLine:endLine:filepath (Cursor/Linear format).
+- Reference existing code with citation fences: ```startLine:endLine:filepath (Cursor/Linear format).
+- Show code changes with a one-sentence summary, then a short ```diff excerpt (≤25 lines, one hunk per file).
+- For large or multi-file changes: summarize in bullets and link the PR; do not paste full git diff output.
 - For complex logic or architecture, include a ```mermaid diagram when it clarifies the flow.
 - Also use short paragraphs, bullets, or numbered steps where helpful.
 - Use markdown sparingly; full URLs for links. Do not over-bold or over-backtick.
