@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -1274,120 +1274,102 @@ class ProgressQueueWorker:
                 self._queue.task_done()
 
 
-# ── Tool Result → Discovery Extractors ─────────────────────────
+# ── Hermes Tool Progress → Discovery Text ─────────────────────────
 
+_HERMES_INTERNAL_TOOL_PREFIX = "_"
 
-def _discovery_read_file(args: dict, result: Any) -> str | None:
-    """Extract discovery: file was read."""
-    if isinstance(result, str) and len(result) > 0:
-        path = args.get("path", "")
-        lines = result.count("\n") + 1
-        # Summarize content briefly
-        preview = result.strip()[:80].replace("\n", " ")
-        return f"Read {path} ({lines} lines): {preview}"
-    return None
-
-
-def _discovery_search_files(args: dict, result: Any) -> str | None:
-    """Extract discovery: file search completed."""
-    if isinstance(result, dict):
-        count = result.get("total_count", 0)
-        if count > 0:
-            return (
-                f"Found {count} matches for"
-                f" '{args.get('pattern', '')[:40]}' in {args.get('path', '.')}"
-            )
-        return "No matches found"
-    return None
-
-
-def _discovery_web_search(args: dict, result: Any) -> str | None:
-    """Extract discovery: web search results."""
-    if isinstance(result, dict):
-        results = result.get("results", [])
-        if results:
-            titles = [r.get("title", "")[:40] for r in results[:3]]
-            return (
-                f"Found {len(results)} web results for"
-                f" '{args.get('query', '')[:50]}': {', '.join(titles)}"
-            )
-        return "No web results found"
-    return None
-
-
-def _discovery_web_extract(args: dict, result: Any) -> str | None:
-    """Extract discovery: URL content fetched."""
-    if isinstance(result, str) and len(result) > 0:
-        urls = args.get("urls", ["?"])
-        url = urls[0][:60] if urls else "?"
-        return f"Fetched {url} ({len(result)} chars)"
-    return None
-
-
-def _discovery_execute_code(args: dict, result: Any) -> str | None:
-    """Extract discovery: code executed."""
-    if isinstance(result, dict) and result.get("status") == "success":
-        outputs = result.get("output", "")
-        preview = outputs[:80].replace("\n", " ") if outputs else "no output"
-        return f"Code executed: {preview}"
-    return None
-
-
-_DISCOVERY_EXTRACTORS: dict[str, Callable[[dict, Any], str | None]] = {
-    "read_file": _discovery_read_file,
-    "search_files": _discovery_search_files,
-    "web_search": _discovery_web_search,
-    "web_extract": _discovery_web_extract,
-    "execute_code": _discovery_execute_code,
+_HERMES_TOOL_VERBS: dict[str, str] = {
+    "read_file": "Reading",
+    "write_file": "Writing",
+    "search_files": "Searching",
+    "web_search": "Searching web",
+    "web_extract": "Fetching",
+    "terminal": "Running",
+    "execute_code": "Running code",
+    "browser": "Browsing",
+    "grep": "Searching",
 }
 
 
-def extract_discovery(tool_name: str, args: dict, result: Any) -> str | None:
-    """Return a discovery statement from a completed tool call, or None.
+def _parse_hermes_tool_args(event: dict) -> dict[str, Any]:
+    """Normalize tool args from a hermes.tool.progress payload."""
+    raw = event.get("input") or event.get("args") or event.get("arguments")
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {"value": raw[:120]}
+        except json.JSONDecodeError:
+            return {"value": raw[:120]}
+    return {}
 
-    Looks up *tool_name* in ``_DISCOVERY_EXTRACTORS`` and calls the
-    registered extractor. Returns None if no extractor is registered
-    or if extraction fails silently.
+
+def _format_hermes_tool_fallback(tool: str, args: dict[str, Any]) -> str | None:
+    """Build display text from tool name + args when Hermes sends no label."""
+    verb = _HERMES_TOOL_VERBS.get(tool, tool.replace("_", " "))
+    if tool == "terminal":
+        cmd = args.get("command") or args.get("value", "")
+        if cmd:
+            return f"Running: {str(cmd)[:120]}"
+    if tool == "web_search":
+        query = args.get("query", "")
+        if query:
+            return f"Searching web for '{str(query)[:60]}'"
+    if tool == "read_file":
+        path = args.get("path", "")
+        if path:
+            return f"Reading {path}"
+    if tool == "search_files":
+        pattern = args.get("pattern", "")
+        if pattern:
+            return f"Searching for '{str(pattern)[:40]}'"
+    if tool == "execute_code":
+        code = args.get("code") or args.get("value", "")
+        if code:
+            return f"Running code: {str(code).replace(chr(10), ' ')[:80]}"
+    if tool == "web_extract":
+        urls = args.get("urls") or []
+        if urls:
+            return f"Fetching {urls[0]}"
+    return verb.capitalize() if verb else None
+
+
+def format_hermes_tool_progress(event: dict) -> str | None:
+    """Convert a hermes.tool.progress SSE payload to Linear timeline text.
+
+    Hermes runs tools server-side and emits progress on a custom SSE channel
+    separate from assistant response tokens, so timeline updates never
+    duplicate the final answer.
     """
-    extractor = _DISCOVERY_EXTRACTORS.get(tool_name)
-    if extractor is None:
-        return None
-    try:
-        return extractor(args, result)
-    except Exception:
+    tool = (event.get("tool") or event.get("name") or "").strip()
+    if not tool or tool.startswith(_HERMES_INTERNAL_TOOL_PREFIX):
         return None
 
+    status = (event.get("status") or "running").lower()
+    if status not in ("running", "completed", ""):
+        return None
 
-# ── LLM Text Streaming ────────────────────────────────────────
+    label = (event.get("label") or "").strip()
+    if label:
+        text = label[:200]
+    else:
+        text = _format_hermes_tool_fallback(tool, _parse_hermes_tool_args(event))
+        if not text:
+            return None
 
+    if status == "completed":
+        output = event.get("output") or event.get("result")
+        if isinstance(output, dict):
+            output = json.dumps(output, ensure_ascii=False)
+        if isinstance(output, str):
+            preview = output.strip().replace("\n", " ")[:80]
+            if preview and preview not in text:
+                return f"{text} — {preview}"
 
-def _strip_markdown(text: str) -> str:
-    """Remove common markdown syntax for clean display in Linear activities.
-
-    Strips bold, italic, inline code, links, headers, list markers, and
-    code blocks so the text reads naturally in Linear's activity feed.
-    Collapses multiple blank lines but preserves actual paragraph breaks.
-    """
-    # Inline code
-    text = re.sub(r'`([^`]+)`', r'\1', text)
-    # Bold/italic (must handle ** before *)
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'__(.+?)__', r'\1', text)
-    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'\1', text)
-    text = re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', r'\1', text)
-    # Links
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-    # Headers
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # List markers
-    text = re.sub(r'^[\s]*[-*+]\s+', '', text, flags=re.MULTILINE)
-    # Horizontal rules
-    text = re.sub(r'\n-{2,}\n', '\n', text)
-    # Code blocks
-    text = re.sub(r'```[\s\S]*?```', '', text)
-    # Collapse excessive blank lines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+    return text
 
 
 # ── Task Processor ──────────────────────────────────────────────────────
@@ -1519,8 +1501,8 @@ class TaskProcessor:
             return (
                 f"You are Hermes, an autonomous agent working on Linear"
                 f" issue {identifier} — {title}.\n"
-                f"You have tools available (filesystem, shell, etc.)."
-                f" Use them to actually do what's asked.\n"
+                f"The Hermes API server runs tools (filesystem, shell, web"
+                f" search) on your behalf during each request.\n"
                 f"\n"
                 f"Your LINEAR_API_KEY for GraphQL API calls to api.linear.app"
                 f" is available as the environment variable $LINEAR_API_KEY"
@@ -1548,8 +1530,8 @@ class TaskProcessor:
             # User @mentioned Hermes or delegated an issue — do the task
             return (
                 f"You are Hermes, an autonomous agent working inside Linear.\n"
-                f"You have tools available (filesystem, shell, etc.)."
-                f" Use them to actually do what's asked.\n"
+                f"The Hermes API server runs tools (filesystem, shell, web"
+                f" search) on your behalf during each request.\n"
                 f"\n"
                 f"Your LINEAR_API_KEY for GraphQL API calls to api.linear.app"
                 f" is available as the environment variable $LINEAR_API_KEY"
@@ -1862,124 +1844,22 @@ class TaskProcessor:
                 f"Could not generate a response. Status: {issue.get('state', {}).get('name', 'Unknown')}",
             )
 
-    def _make_tool_discovery(self, tool_name: str, args: dict) -> str | None:
-        """Generate a natural summary from tool name and args (fallback).
-
-        Used when local execution fails or produces no result. Produces
-        conversational past-tense summaries that read like cursor output.
-        """
-        if tool_name == "read_file":
-            path = args.get("path", "")
-            if path:
-                return f"Read {os.path.basename(path.rstrip('/'))}"
-        elif tool_name == "search_files":
-            pattern = args.get("pattern", "")
-            search_path = args.get("path", ".")
-            if pattern:
-                return f"Searched for '{pattern[:40]}' in {search_path}"
-        elif tool_name == "web_search":
-            query = args.get("query", "")
-            if query:
-                return f"Searched web for '{query[:50]}'"
-        elif tool_name == "web_extract":
-            urls = args.get("urls", [])
-            if urls:
-                return f"Fetched content from {urls[0][:60]}"
-        elif tool_name == "execute_code":
-            code = args.get("code", "")
-            preview = code[:50].replace("\n", " ") if code else ""
-            if preview:
-                return f"Ran code: {preview}"
-        return None
-
-    async def _execute_tool_locally(
-        self, tool_name: str, args: dict,
-    ) -> dict | str | None:
-        """Execute a tool locally on the same machine for discovery extraction.
-
-        Runs independently of the Hermes API's own tool execution. The result
-        is used only for discovery extraction, not for the LLM's reasoning.
-        Returns a result dict compatible with ``_DISCOVERY_EXTRACTORS``,
-        or None if the tool can't be executed locally.
-        """
-        try:
-            if tool_name == "read_file":
-                path = args.get("path", "")
-                if not path:
-                    return None
-                # Expand ~/ and env vars
-                path = os.path.expanduser(os.path.expandvars(path))
-                if not os.path.isfile(path):
-                    return None
-                with open(path) as f:
-                    content = f.read(2000)  # First 2000 chars enough for discovery
-                return content
-
-            elif tool_name == "search_files":
-                pattern = args.get("pattern", "")
-                search_path = args.get("path", ".")
-                file_glob = args.get("file_glob", "")
-                search_path = os.path.expanduser(os.path.expandvars(search_path))
-                if not pattern:
-                    return None
-                cmd = ["grep", "-rl", pattern, search_path]
-                if file_glob:
-                    cmd = ["grep", "-rl", f"--include={file_glob}", pattern, search_path]
-                r = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await r.communicate()
-                matches = stdout.decode().strip().split("\n") if stdout.strip() else []
-                return {"total_count": len(matches), "matches": matches[:20]}
-
-            elif tool_name == "web_extract":
-                urls = args.get("urls", [])
-                if not urls:
-                    return None
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.get(urls[0], headers={"User-Agent": "HermesLinearAgent/1.0"})
-                    if resp.status_code == 200:
-                        return resp.text[:2000]
-                return None
-
-            elif tool_name == "execute_code":
-                code = args.get("code", "")
-                if not code:
-                    return None
-                r = await asyncio.create_subprocess_exec(
-                    "python3", "-c", code,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await asyncio.wait_for(
-                    r.communicate(), timeout=30,
-                )
-                return {
-                    "status": "success" if r.returncode == 0 else "error",
-                    "output": (stdout.decode() + stderr.decode())[:2000],
-                }
-
-            return None
-        except Exception:
-            log.debug("Local tool execution failed for %s: not available", tool_name)
-            return None
-
     async def _call_llm(
         self, prompt: str, session_id: str = "",
         tracker: DiscoveryTracker | None = None,
     ) -> str | None:
         """Call Hermes API server for reasoning with streaming support.
-        Streams thinking tokens as thought activities when session_id is provided.
-        Extracts discovery findings from LLM output when tracker is provided.
+
+        Parses Hermes' custom ``hermes.tool.progress`` SSE events for
+        DiscoveryTracker timeline updates. Response text is accumulated
+        separately and never streamed to Linear (avoids duplication).
         Retries once (5s backoff) on timeout or 5xx responses.
-        Logs response length and elapsed time on every successful 200 response.
         """
         if not settings.hermes_api_key:
             log.warning("HERMES_API_KEY not set — cannot call LLM")
             return None
 
-        last_drought_time = 0.0  # Independent timer for content-drought keepalives
-        known_findings: set[str] = set()
+        last_drought_time = 0.0
 
         for attempt in range(2):
             start = time.monotonic()
@@ -1988,14 +1868,18 @@ class TaskProcessor:
                 progress_worker.start()
             try:
                 accumulated = ""
+                headers = {
+                    "Authorization": f"Bearer {settings.hermes_api_key}",
+                    "Content-Type": "application/json",
+                }
+                if session_id:
+                    headers["X-Hermes-Session-Id"] = session_id
+
                 async with httpx.AsyncClient(timeout=600.0) as client:
                     async with client.stream(
                         "POST",
                         f"{settings.hermes_api_url}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {settings.hermes_api_key}",
-                            "Content-Type": "application/json",
-                        },
+                        headers=headers,
                         json={
                             "model": settings.hermes_model,
                             "messages": [
@@ -2004,6 +1888,7 @@ class TaskProcessor:
                             "temperature": 0.7,
                             "max_tokens": 1000,
                             "stream": True,
+                            "stream_tool_progress": True,
                         },
                     ) as resp:
                         if resp.status_code != 200:
@@ -2017,15 +1902,48 @@ class TaskProcessor:
                                 continue
                             return None
 
-                        # Track tool calls from the stream for local discovery extraction
-                        tool_calls_map: dict[int, dict] = {}
+                        current_event = ""
+                        seen_progress: set[str] = set()
 
                         async for line in resp.aiter_lines():
-                            if not line.startswith("data: "):
+                            line = line.strip()
+                            if not line:
                                 continue
-                            payload = line[6:].strip()
+                            if line.startswith("event:"):
+                                current_event = line[6:].strip()
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
                             if payload == "[DONE]":
                                 break
+
+                            if current_event == "hermes.tool.progress":
+                                try:
+                                    progress_data = json.loads(payload)
+                                except json.JSONDecodeError:
+                                    current_event = ""
+                                    continue
+                                discovery = format_hermes_tool_progress(
+                                    progress_data,
+                                )
+                                if (
+                                    discovery
+                                    and tracker
+                                    and progress_worker
+                                    and discovery not in seen_progress
+                                ):
+                                    seen_progress.add(discovery)
+                                    tracker._keepalive_ctx = discovery[:100]
+                                    tracker._skip_texts.add(discovery)
+                                    await progress_worker.put(discovery)
+                                    log.info(
+                                        "Hermes tool progress: %s",
+                                        discovery[:80],
+                                    )
+                                current_event = ""
+                                continue
+
                             try:
                                 chunk = json.loads(payload)
                             except json.JSONDecodeError:
@@ -2036,86 +1954,11 @@ class TaskProcessor:
                                 continue
                             delta = choices[0].get("delta", {})
 
-                            # ── Tool Call Accumulation ──
-                            tool_calls = delta.get("tool_calls")
-                            if tool_calls:
-                                for tc in tool_calls:
-                                    idx = tc.get("index", 0)
-                                    if idx not in tool_calls_map:
-                                        tool_calls_map[idx] = {
-                                            "id": "", "type": "function",
-                                            "function": {"name": "", "arguments": ""},
-                                        }
-                                    if tc.get("id"):
-                                        tool_calls_map[idx]["id"] = tc["id"]
-                                    fn = tc.get("function", {})
-                                    if fn.get("name"):
-                                        tool_calls_map[idx]["function"]["name"] = fn["name"]
-                                    if fn.get("arguments"):
-                                        tool_calls_map[idx]["function"]["arguments"] += fn["arguments"]
-                                    # Emit action activity for the tool call
-                                    fn_name = tool_calls_map[idx]["function"]["name"]
-                                    if fn_name and session_id and idx == len(tool_calls_map) - 1:
-                                        asyncio.create_task(
-                                            self.linear.create_activity(
-                                                session_id,
-                                                ActivityType.action,
-                                                body=f"**{fn_name}** {(', '.join(f'{k}={v}' for k, v in json.loads(tool_calls_map[idx]['function']['arguments'] or '{}').items()))[:100]}",
-                                                action_label=fn_name,
-                                                action_param=tool_calls_map[idx]["function"]["arguments"][:100],
-                                                ephemeral=True,
-                                            )
-                                        )
-                                        log.info("Stream: tool call %s", fn_name)
-
-                            # ── Detect completion of tool calls ──
-                            # If tool_calls_map has items and current delta has no tool_calls,
-                            # the tool call batch completed — execute locally for discovery.
-                            finish_reason = choices[0].get("finish_reason")
-                            if tool_calls_map and (not tool_calls or finish_reason == "tool_calls"):
-                                # Execute all accumulated tool calls locally for discovery extraction
-                                for idx in sorted(tool_calls_map.keys()):
-                                    tc = tool_calls_map[idx]
-                                    fn_name = tc["function"]["name"]
-                                    try:
-                                        fn_args = json.loads(tc["function"]["arguments"] or "{}")
-                                    except json.JSONDecodeError:
-                                        fn_args = {}
-                                    if fn_name and tracker:
-                                        # First try: execute locally and extract from result
-                                        local_result = await self._execute_tool_locally(fn_name, fn_args)
-                                        if local_result is not None:
-                                            discovery = extract_discovery(fn_name, fn_args, local_result)
-                                        else:
-                                            discovery = None
-                                        # Fallback: generate from tool name+args alone
-                                        if not discovery:
-                                            discovery = self._make_tool_discovery(fn_name, fn_args)
-                                        if discovery:
-                                            # Natural progress update (cursor-style)
-                                            known_findings.add(discovery)
-                                            tracker._keepalive_ctx = discovery[:100]
-                                            tracker._skip_texts.add(discovery)
-                                            await progress_worker.put(discovery)
-                                tool_calls_map.clear()
-
-                            # Accumulate content
                             content = delta.get("content", "")
                             if content:
                                 accumulated += content
 
                             now = time.monotonic()
-
-                            # Content-drought emission: when SSE chunks arrive without
-                            # content tokens (e.g., DeepSeek thinking phase with hidden
-                            # reasoning), emit the tracker's contextual keepalive so
-                            # the user sees live progress during the wait instead of
-                            # everything appearing in a burst at the end.
-                            #
-                            # `content` is the current delta's content field.
-                            # When empty but chunks keep arriving, the model is
-                            # reasoning internally (thinking phase). Emit a
-                            # progress update every ~5 seconds during drought.
                             if (
                                 session_id
                                 and not content
@@ -2127,6 +1970,8 @@ class TaskProcessor:
                                         await progress_worker.put(ctx[:200])
                                 last_drought_time = now
 
+                            current_event = ""
+
                 elapsed = time.monotonic() - start
                 result = accumulated.strip() if accumulated else None
                 log.info(
@@ -2134,17 +1979,6 @@ class TaskProcessor:
                     len(result or ""), elapsed, attempt + 1,
                 )
 
-                # Emit a final thinking indicator if streaming was happening
-                if session_id and elapsed > 5:
-                    await self.linear.create_activity(
-                        session_id,
-                        ActivityType.thought,
-                        body="Processing complete -- generating response...",
-                        ephemeral=True,
-                    )
-
-                # Drain progress queue before returning so all thought
-                # activities are visible in Linear's timeline.
                 if progress_worker:
                     await progress_worker.drain_and_stop()
 
