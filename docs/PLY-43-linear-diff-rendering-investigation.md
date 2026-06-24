@@ -1,6 +1,10 @@
 # PLY-43: Cursor-style code diff rendering in Linear UI
 
-**Status:** Investigation complete  
+**Status:** Investigation complete — **superseded by PR linking** (see branch `cursor/link-prs-linear-diffs-f5fe`)
+
+> **Correction (2026-06-24):** The original report focused on markdown `diff` blocks in agent chat. That was the wrong surface. Linear's native diff UI is **[Linear Diffs](https://linear.app/docs/diffs)** — it renders GitHub PRs, not pasted patches. Hermes should **open a PR and link it** on the agent session via `externalUrls`; Linear handles the rest.
+
+**Status (original):** Investigation complete  
 **Date:** 2026-06-24  
 **Decision:** Use **summary + short `diff` excerpts** for code changes; keep **Cursor citations** for existing-code references. Avoid raw full patches and plain code blocks for diffs.
 

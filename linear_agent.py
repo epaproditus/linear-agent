@@ -77,6 +77,7 @@ Work style:
 - When a Hermes skill matches the task, read and follow it completely before improvising.
 - Investigate with tools before concluding; the internal draft can be thorough.
 - When changing code: smallest correct diff, match existing patterns, no drive-by edits.
+- When you modify code in a git repository: use a dedicated branch, commit, push, and open a GitHub pull request (`gh pr create`). Reference the Linear issue identifier in the PR title or body (e.g. "Fixes PLY-43") so Linear auto-links the PR to the issue. Include the PR URL in your final answer.
 - Comments only for non-obvious logic; no over-engineering or speculative edge cases.
 - Track multi-step work mentally; the session plan checklist in Linear shows progress.
 """.strip()
@@ -87,8 +88,7 @@ Reply style (Linear issue comment — user already saw tool progress on the time
 - Match depth to the question — short questions get short answers.
 - Open with the finding, answer, or decision — not setup or process narration.
 - Reference existing code with citation fences: ```startLine:endLine:filepath (Cursor/Linear format).
-- Show code changes with a one-sentence summary, then a short ```diff excerpt (≤25 lines, one hunk per file).
-- For large or multi-file changes: summarize in bullets and link the PR; do not paste full git diff output.
+- For code changes: include the GitHub PR URL in your reply. Linear shows the full diff in its Reviews UI — do not paste large patches or ```diff blocks in chat.
 - For complex logic or architecture, include a ```mermaid diagram when it clarifies the flow.
 - Also use short paragraphs, bullets, or numbered steps where helpful.
 - Use markdown sparingly; full URLs for links. Do not over-bold or over-backtick.
@@ -768,6 +768,7 @@ class LinearClient:
         session_id: str,
         *,
         external_urls: list[dict[str, str]] | None = None,
+        added_external_urls: list[dict[str, str]] | None = None,
         summary: str | None = None,
     ) -> bool:
         """Update session metadata."""
@@ -775,6 +776,11 @@ class LinearClient:
         if external_urls is not None:
             inp["externalUrls"] = [{"label": u["label"], "url": u["url"]}
                                    for u in external_urls]
+        if added_external_urls is not None:
+            inp["addedExternalUrls"] = [
+                {"label": u["label"], "url": u["url"]}
+                for u in added_external_urls
+            ]
         if summary is not None:
             inp["summary"] = summary
         data = await self._gql(GQL_UPDATE_SESSION, {
@@ -819,7 +825,8 @@ class CodingBridge:
 
         ---
         Please implement the solution. Run any relevant tests.
-        Do NOT create a git commit — the agent will handle that.
+        When done: commit on a branch, push, and open a GitHub pull request
+        (`gh pr create`). Reference the issue in the PR body. Return the PR URL.
         """).strip()
 
         if self.backend == "claude":
@@ -1539,6 +1546,34 @@ def _is_url(text: str) -> bool:
     return t.startswith("http://") or t.startswith("https://")
 
 
+_GITHUB_PR_URL_RE = re.compile(
+    r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)",
+    re.I,
+)
+
+
+def extract_github_pr_urls(*texts: str) -> list[str]:
+    """Return unique GitHub PR URLs found in any of the given text blobs."""
+    seen: set[str] = set()
+    urls: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for match in _GITHUB_PR_URL_RE.finditer(text):
+            url = match.group(0).rstrip(").,]>")
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
+def _pr_external_url_label(url: str) -> str:
+    match = _GITHUB_PR_URL_RE.search(url)
+    if match:
+        return f"PR #{match.group(1)}"
+    return "Pull Request"
+
+
 def _summarize_url(url: str) -> str:
     lower = url.lower()
     if "hermes-agent.nousresearch.com" in lower:
@@ -1876,6 +1911,51 @@ class TaskProcessor:
             self._viewer_id = await self.linear.get_viewer_id()
         return self._viewer_id
 
+    async def _link_prs_to_session(
+        self,
+        session_id: str,
+        response_text: str,
+        *,
+        draft_text: str = "",
+        tool_progress: list[str] | None = None,
+    ) -> list[str]:
+        """Attach GitHub PR URLs to the agent session for Linear Diffs."""
+        texts = [response_text, draft_text]
+        if tool_progress:
+            texts.extend(tool_progress)
+        pr_urls = extract_github_pr_urls(*texts)
+        if not pr_urls:
+            return []
+
+        added = [
+            {"label": _pr_external_url_label(url), "url": url}
+            for url in pr_urls
+        ]
+        ok = await self.linear.update_session(
+            session_id,
+            added_external_urls=added,
+        )
+        if ok:
+            log.info(
+                "Linked %d PR(s) to session %s: %s",
+                len(pr_urls), session_id[:8], ", ".join(pr_urls),
+            )
+        else:
+            log.warning(
+                "Failed to link PR(s) to session %s", session_id[:8],
+            )
+        return pr_urls
+
+    def _ensure_pr_urls_in_response(
+        self, response_text: str, pr_urls: list[str],
+    ) -> str:
+        """Append PR link if Hermes created one but omitted it from the reply."""
+        missing = [u for u in pr_urls if u not in response_text]
+        if not missing:
+            return response_text
+        heading = "Pull requests" if len(missing) > 1 else "Pull request"
+        lines = "\n".join(f"- {url}" for url in missing)
+        return f"{response_text.rstrip()}\n\n**{heading}:**\n{lines}\n"
 
     async def process(
         self, session: AgentSession, issue: dict[str, Any] | None
@@ -2371,11 +2451,22 @@ class TaskProcessor:
             if child_issue and review_id:
                 await self.linear.update_issue(child_issue["id"], stateId=review_id)
 
+            pr_urls = await self._link_prs_to_session(
+                session_id,
+                output,
+            )
+            pr_note = ""
+            if pr_urls:
+                pr_note = (
+                    f"\n\nReview the diff in Linear Reviews: {pr_urls[0]}"
+                )
+
             await self.linear.send_response(
                 session_id,
                 f"**Done!** {settings.coding_agent.title()} Code finished "
-                f"working on **{identifier}**.\n"
-                f"{'Review changes in child issue: ' + child_ref if child_ref else ''}",
+                f"working on **{identifier}**."
+                f"{' Review changes in child issue: ' + child_ref if child_ref else ''}"
+                f"{pr_note}",
             )
 
         elif result["error"]:
@@ -2492,6 +2583,17 @@ class TaskProcessor:
                     log.warning(
                         "Phase-2 summary failed; sending phase-1 draft",
                     )
+
+            tool_progress = tracker.tool_progress if tracker else None
+            pr_urls = await self._link_prs_to_session(
+                session_id,
+                response_text,
+                draft_text=draft_text,
+                tool_progress=tool_progress,
+            )
+            response_text = self._ensure_pr_urls_in_response(
+                response_text, pr_urls,
+            )
 
             await plan.finish()
             await self.linear.send_response(session_id, response_text)
