@@ -1858,6 +1858,7 @@ class TaskProcessor:
         user_request: str,
         internal_text: str = "",
         skills_context: str = "",
+        plan_steps: list[str] | None = None,
     ) -> str:
         """Assemble the full LLM prompt from session + issue context.
 
@@ -1918,6 +1919,7 @@ class TaskProcessor:
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
                 f"{skills_block}"
+                f"{plan_block}"
                 f"{internal_text}\n"
                 f"{conversation_text}\n"
                 f"User: {user_request}\n"
@@ -1953,6 +1955,7 @@ class TaskProcessor:
                 f"Labels: {', '.join(labels) or 'none'}\n"
                 f"Description: {description or '(no description)'}\n"
                 f"{skills_block}"
+                f"{plan_block}"
                 f"{internal_text}\n"
                 f"{conversation_text}\n"
                 f"\n"
@@ -2322,10 +2325,6 @@ class TaskProcessor:
         user_request = session.body or description or f"Respond to issue {identifier}"
 
         skills_context = await self._fetch_hermes_skills_context()
-        prompt = self.build_llm_prompt(
-            session, issue, conversation_text, user_request, internal_text,
-            skills_context=skills_context,
-        )
 
         plan = SessionPlanTracker(session_id=session_id, linear=self.linear)
         hermes_steps = await self._call_llm_plan(
@@ -2340,6 +2339,12 @@ class TaskProcessor:
             await plan.set_from_hermes(hermes_steps)
         else:
             await plan.start_fallback(identifier)
+
+        prompt = self.build_llm_prompt(
+            session, issue, conversation_text, user_request, internal_text,
+            skills_context=skills_context,
+            plan_steps=hermes_steps or [s["content"] for s in plan.steps],
+        )
 
         # Initialize DiscoveryTracker for result-oriented progress updates
         tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
