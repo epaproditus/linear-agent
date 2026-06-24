@@ -1241,19 +1241,42 @@ class DiscoveryTracker:
 
 @dataclass
 class SessionPlanTracker:
-    """Linear Agent Plans checklist — Cursor-style todo visibility in the session UI."""
+    """Linear Agent Plans checklist — steps from Hermes, synced to Linear."""
 
     session_id: str
     linear: LinearClient
     steps: list[dict[str, str]] = field(default_factory=list)
 
-    async def start(self, identifier: str) -> None:
+    async def start_fallback(self, identifier: str) -> None:
+        """Generic plan when Hermes planning call fails."""
         self.steps = [
             {"content": f"Examine {identifier}", "status": _PLAN_DONE},
             {"content": "Investigate with tools", "status": _PLAN_ACTIVE},
             {"content": "Deliver final answer", "status": _PLAN_PENDING},
         ]
         await self._sync()
+
+    async def set_from_hermes(self, step_texts: list[str]) -> None:
+        """Apply Hermes-authored plan steps; first step is in progress."""
+        texts = [t.strip()[:200] for t in step_texts if t.strip()][:7]
+        if len(texts) < 2:
+            return
+        self.steps = [
+            {"content": text, "status": _PLAN_PENDING} for text in texts
+        ]
+        self.steps[0]["status"] = _PLAN_ACTIVE
+        await self._sync()
+
+    async def advance(self) -> None:
+        """Complete the active step and start the next (on each tool progress)."""
+        for i, step in enumerate(self.steps):
+            if step["status"] != _PLAN_ACTIVE:
+                continue
+            step["status"] = _PLAN_DONE
+            if i + 1 < len(self.steps):
+                self.steps[i + 1]["status"] = _PLAN_ACTIVE
+            await self._sync()
+            return
 
     async def finish(self) -> None:
         self.steps = [
@@ -1262,10 +1285,40 @@ class SessionPlanTracker:
         await self._sync()
 
     async def _sync(self) -> None:
+        if not self.steps:
+            return
         try:
             await self.linear.update_plan(self.session_id, self.steps)
         except Exception:
             log.warning("Session plan update failed", exc_info=True)
+
+
+def _parse_hermes_plan_json(text: str) -> list[str]:
+    """Extract plan step strings from Hermes planning response JSON."""
+    raw = text.strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
+    if fence:
+        raw = fence.group(1).strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, list):
+        return [str(s).strip() for s in data if str(s).strip()]
+    if isinstance(data, dict):
+        for key in ("steps", "plan", "tasks"):
+            items = data.get(key)
+            if isinstance(items, list):
+                out: list[str] = []
+                for item in items:
+                    if isinstance(item, str):
+                        out.append(item.strip())
+                    elif isinstance(item, dict):
+                        label = item.get("content") or item.get("step") or item.get("title")
+                        if label:
+                            out.append(str(label).strip())
+                return [s for s in out if s]
+    return []
 
 
 class ProgressQueueWorker:
@@ -1838,6 +1891,14 @@ class TaskProcessor:
                 f"{skills_context}\n"
             )
 
+        plan_block = ""
+        if plan_steps:
+            plan_block = (
+                "\nYour plan for this issue (follow in order):\n"
+                + "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan_steps))
+                + "\n"
+            )
+
         if session.action == SessionAction.prompted:
             # Follow-up turn — continue the work/conversation in this thread
             return (
@@ -1938,6 +1999,91 @@ class TaskProcessor:
         except Exception:
             log.debug("Could not fetch Hermes skills list", exc_info=True)
             return ""
+
+    def _build_plan_prompt(
+        self,
+        identifier: str,
+        title: str,
+        user_request: str,
+        description: str,
+        skills_context: str = "",
+    ) -> str:
+        skills_block = ""
+        if skills_context:
+            skills_block = f"\nAvailable skills:\n{skills_context}\n"
+        desc = (description or "")[:800]
+        return (
+            "You are Hermes, planning how to handle a Linear issue.\n"
+            "Do not use tools. Output a JSON plan only.\n"
+            "\n"
+            f"Issue: {identifier} — {title}\n"
+            f"Description: {desc or '(none)'}\n"
+            f"{skills_block}"
+            f"User request:\n{user_request}\n"
+            "\n"
+            "Return 3–7 concrete investigation steps specific to this issue.\n"
+            "Each step is an action you will perform (read file, search, run"
+            " command, verify fix, etc.) — not generic labels.\n"
+            "Do not include 'write final answer' — that is implicit.\n"
+            "\n"
+            'Respond with JSON only: {"steps": ["step one", "step two", ...]}'
+        )
+
+    async def _call_llm_plan(
+        self,
+        identifier: str,
+        title: str,
+        user_request: str,
+        description: str,
+        session_id: str = "",
+        skills_context: str = "",
+    ) -> list[str]:
+        """Ask Hermes for issue-specific plan steps before investigation."""
+        if not settings.hermes_api_key:
+            return []
+
+        prompt = self._build_plan_prompt(
+            identifier, title, user_request, description, skills_context,
+        )
+        headers = {
+            "Authorization": f"Bearer {settings.hermes_api_key}",
+            "Content-Type": "application/json",
+        }
+        if session_id:
+            headers["X-Hermes-Session-Id"] = f"{session_id}:plan"
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{settings.hermes_api_url}/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": settings.hermes_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.2,
+                        "max_tokens": 500,
+                        "stream": False,
+                        "stream_tool_progress": False,
+                    },
+                )
+                if resp.status_code != 200:
+                    log.warning("Plan call: Hermes API returned %d", resp.status_code)
+                    return []
+                data = resp.json()
+                content = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                steps = _parse_hermes_plan_json(content or "")
+                if len(steps) >= 2:
+                    log.info("Hermes plan: %d steps for %s", len(steps), identifier)
+                    return steps[:7]
+                log.warning("Plan call: unparseable or too few steps")
+                return []
+        except Exception:
+            log.warning("Plan call failed", exc_info=True)
+            return []
 
     async def _is_coding_task(self, issue: dict[str, Any]) -> bool:
         """Determine if the issue requires coding work.
@@ -2182,7 +2328,18 @@ class TaskProcessor:
         )
 
         plan = SessionPlanTracker(session_id=session_id, linear=self.linear)
-        await plan.start(identifier)
+        hermes_steps = await self._call_llm_plan(
+            identifier=identifier,
+            title=title,
+            user_request=user_request,
+            description=description,
+            session_id=session_id,
+            skills_context=skills_context,
+        )
+        if hermes_steps:
+            await plan.set_from_hermes(hermes_steps)
+        else:
+            await plan.start_fallback(identifier)
 
         # Initialize DiscoveryTracker for result-oriented progress updates
         tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
@@ -2195,7 +2352,9 @@ class TaskProcessor:
         )
 
         try:
-            draft_text = await self._call_llm(prompt, session_id, tracker)
+            draft_text = await self._call_llm(
+                prompt, session_id, tracker, plan=plan,
+            )
         finally:
             keepalive_task.cancel()
             try:
@@ -2247,6 +2406,7 @@ class TaskProcessor:
     async def _call_llm(
         self, prompt: str, session_id: str = "",
         tracker: DiscoveryTracker | None = None,
+        plan: SessionPlanTracker | None = None,
     ) -> str | None:
         """Call Hermes API server for reasoning with streaming support.
 
@@ -2352,6 +2512,8 @@ class TaskProcessor:
                                     tracker._skip_texts.add(discovery)
                                     tracker.tool_progress.append(discovery)
                                     await progress_worker.put(discovery)
+                                    if plan:
+                                        await plan.advance()
                                     log.info(
                                         "Hermes tool progress: %s",
                                         discovery[:80],
