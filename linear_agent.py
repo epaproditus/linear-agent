@@ -68,22 +68,17 @@ ACTIVITY_TIMEOUT_S = 10    # Must emit first activity within 10s
 KEEPALIVE_INTERVAL_S = 15  # Emit keepalive activity every 15s during LLM processing (was 45s)
 PORT = 8660
 
-# ── Hermes response style (adapted from Cursor user rules) ─────────────────
-#
-# Transferred: clear prose, proportional depth, simple language, minimal
-# code diffs, match repo conventions, structured complex answers.
-#
-# Not transferred (Cursor-only): startLine:endLine:filepath citations,
-# mermaid rendering, todo tool, cloud-agent git/PR workflow, "use skills
-# when relevant", and shell-instruction meta ("run commands yourself").
-# Linear: use bullets/numbered steps instead of mermaid; full URLs for links.
+# ── Hermes response style (Cursor user rules → Linear/Hermes) ──────────────
 
 HERMES_WORK_STYLE = """
 Work style:
+- Run tools and shell commands yourself — never ask the user to run commands.
 - Use the full issue thread and prior comments as context; do not ignore earlier turns.
+- When a Hermes skill matches the task, read and follow it completely before improvising.
 - Investigate with tools before concluding; the internal draft can be thorough.
 - When changing code: smallest correct diff, match existing patterns, no drive-by edits.
 - Comments only for non-obvious logic; no over-engineering or speculative edge cases.
+- Track multi-step work mentally; the session plan checklist in Linear shows progress.
 """.strip()
 
 HERMES_REPLY_STYLE = """
@@ -91,12 +86,18 @@ Reply style (Linear issue comment — user already saw tool progress on the time
 - Write like a clear technical post: complete sentences, plain language, no jargon padding.
 - Match depth to the question — short questions get short answers.
 - Open with the finding, answer, or decision — not setup or process narration.
-- For multi-part or architectural answers: use short paragraphs, bullets, or numbered steps.
-  Do not use mermaid (Linear does not render it); ASCII only if it genuinely helps.
+- Reference code with citation fences: ```startLine:endLine:filepath (Cursor/Linear format).
+- For complex logic or architecture, include a ```mermaid diagram when it clarifies the flow.
+- Also use short paragraphs, bullets, or numbered steps where helpful.
 - Use markdown sparingly; full URLs for links. Do not over-bold or over-backtick.
 - No filler endings ("let me know if…", "happy to help", "say the word").
 - Preserve every fact, recommendation, and code change from the draft.
 """.strip()
+
+# Linear agent session plan step statuses (Agent Plans API).
+_PLAN_PENDING = "pending"
+_PLAN_ACTIVE = "inProgress"
+_PLAN_DONE = "completed"
 
 # ── Rate Limiting ──
 MAX_CONCURRENT_SESSIONS = 10    # Max concurrent LLM session handlers
@@ -1238,6 +1239,35 @@ class DiscoveryTracker:
         return "Working on it..."
 
 
+@dataclass
+class SessionPlanTracker:
+    """Linear Agent Plans checklist — Cursor-style todo visibility in the session UI."""
+
+    session_id: str
+    linear: LinearClient
+    steps: list[dict[str, str]] = field(default_factory=list)
+
+    async def start(self, identifier: str) -> None:
+        self.steps = [
+            {"content": f"Examine {identifier}", "status": _PLAN_DONE},
+            {"content": "Investigate with tools", "status": _PLAN_ACTIVE},
+            {"content": "Deliver final answer", "status": _PLAN_PENDING},
+        ]
+        await self._sync()
+
+    async def finish(self) -> None:
+        self.steps = [
+            {**step, "status": _PLAN_DONE} for step in self.steps
+        ]
+        await self._sync()
+
+    async def _sync(self) -> None:
+        try:
+            await self.linear.update_plan(self.session_id, self.steps)
+        except Exception:
+            log.warning("Session plan update failed", exc_info=True)
+
+
 class ProgressQueueWorker:
     """Dedicated background worker that drains a queue of progress text
     and POSTs each item to Linear via ``tracker.progress()``.
@@ -1774,6 +1804,7 @@ class TaskProcessor:
         conversation_text: str,
         user_request: str,
         internal_text: str = "",
+        skills_context: str = "",
     ) -> str:
         """Assemble the full LLM prompt from session + issue context.
 
@@ -1800,6 +1831,13 @@ class TaskProcessor:
         team_name = team.get("name", "")
         team_key = team.get("key", "")
 
+        skills_block = ""
+        if skills_context:
+            skills_block = (
+                f"\nAvailable Hermes skills (use when relevant — follow fully):\n"
+                f"{skills_context}\n"
+            )
+
         if session.action == SessionAction.prompted:
             # Follow-up turn — continue the work/conversation in this thread
             return (
@@ -1818,6 +1856,7 @@ class TaskProcessor:
                 f"Team: {team_name}"
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
+                f"{skills_block}"
                 f"{internal_text}\n"
                 f"{conversation_text}\n"
                 f"User: {user_request}\n"
@@ -1852,6 +1891,7 @@ class TaskProcessor:
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
                 f"Description: {description or '(no description)'}\n"
+                f"{skills_block}"
                 f"{internal_text}\n"
                 f"{conversation_text}\n"
                 f"\n"
@@ -1869,6 +1909,35 @@ class TaskProcessor:
                 f" starting. Be concise. Do not introduce yourself or list"
                 f" capabilities."
             )
+
+    async def _fetch_hermes_skills_context(self) -> str:
+        """List Hermes skills from the API server for prompt injection."""
+        if not settings.hermes_api_key:
+            return ""
+        url = f"{settings.hermes_api_url.rstrip('/')}/skills"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {settings.hermes_api_key}"},
+                )
+                if resp.status_code != 200:
+                    return ""
+                data = resp.json()
+                if not isinstance(data, list):
+                    return ""
+                lines: list[str] = []
+                for skill in data[:30]:
+                    if not isinstance(skill, dict):
+                        continue
+                    name = skill.get("name", "")
+                    desc = (skill.get("description") or "")[:120]
+                    if name:
+                        lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+                return "\n".join(lines)
+        except Exception:
+            log.debug("Could not fetch Hermes skills list", exc_info=True)
+            return ""
 
     async def _is_coding_task(self, issue: dict[str, Any]) -> bool:
         """Determine if the issue requires coding work.
@@ -2106,10 +2175,14 @@ class TaskProcessor:
         # The user's actual request (from the comment that triggered this)
         user_request = session.body or description or f"Respond to issue {identifier}"
 
-        # Build the full prompt using the extracted method
+        skills_context = await self._fetch_hermes_skills_context()
         prompt = self.build_llm_prompt(
             session, issue, conversation_text, user_request, internal_text,
+            skills_context=skills_context,
         )
+
+        plan = SessionPlanTracker(session_id=session_id, linear=self.linear)
+        await plan.start(identifier)
 
         # Initialize DiscoveryTracker for result-oriented progress updates
         tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
@@ -2153,6 +2226,7 @@ class TaskProcessor:
                         "Phase-2 summary failed; sending phase-1 draft",
                     )
 
+            await plan.finish()
             await self.linear.send_response(session_id, response_text)
             # Task complete — move to "In Review" for the user
             if session.action != SessionAction.prompted:
