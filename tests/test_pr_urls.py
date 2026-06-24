@@ -1,3 +1,10 @@
+"""Tests for GitHub PR URL extraction used by linear-agent to link PRs to Linear sessions.
+
+When Hermes creates a PR, linear-agent extracts the URL from the response text
+so it can attach it to the agent session via addedExternalUrls. Linear then
+renders the PR diff in its Reviews UI.
+"""
+
 import os
 import unittest
 
