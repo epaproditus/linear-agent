@@ -68,6 +68,36 @@ ACTIVITY_TIMEOUT_S = 10    # Must emit first activity within 10s
 KEEPALIVE_INTERVAL_S = 15  # Emit keepalive activity every 15s during LLM processing (was 45s)
 PORT = 8660
 
+# ── Hermes response style (adapted from Cursor user rules) ─────────────────
+#
+# Transferred: clear prose, proportional depth, simple language, minimal
+# code diffs, match repo conventions, structured complex answers.
+#
+# Not transferred (Cursor-only): startLine:endLine:filepath citations,
+# mermaid rendering, todo tool, cloud-agent git/PR workflow, "use skills
+# when relevant", and shell-instruction meta ("run commands yourself").
+# Linear: use bullets/numbered steps instead of mermaid; full URLs for links.
+
+HERMES_WORK_STYLE = """
+Work style:
+- Use the full issue thread and prior comments as context; do not ignore earlier turns.
+- Investigate with tools before concluding; the internal draft can be thorough.
+- When changing code: smallest correct diff, match existing patterns, no drive-by edits.
+- Comments only for non-obvious logic; no over-engineering or speculative edge cases.
+""".strip()
+
+HERMES_REPLY_STYLE = """
+Reply style (Linear issue comment — user already saw tool progress on the timeline):
+- Write like a clear technical post: complete sentences, plain language, no jargon padding.
+- Match depth to the question — short questions get short answers.
+- Open with the finding, answer, or decision — not setup or process narration.
+- For multi-part or architectural answers: use short paragraphs, bullets, or numbered steps.
+  Do not use mermaid (Linear does not render it); ASCII only if it genuinely helps.
+- Use markdown sparingly; full URLs for links. Do not over-bold or over-backtick.
+- No filler endings ("let me know if…", "happy to help", "say the word").
+- Preserve every fact, recommendation, and code change from the draft.
+""".strip()
+
 # ── Rate Limiting ──
 MAX_CONCURRENT_SESSIONS = 10    # Max concurrent LLM session handlers
 RATE_LIMIT_WINDOW_S = 60       # Sliding window duration (seconds)
@@ -1796,6 +1826,8 @@ class TaskProcessor:
                 f" draft. Tool actions appear on the Linear timeline as they"
                 f" run; a separate pass will write the user-facing reply.\n"
                 f"\n"
+                f"{HERMES_WORK_STYLE}\n"
+                f"\n"
                 f"Respond to the new message. If it asks you to do something,"
                 f" do it now with your tools and report the result."
                 f" If it's casual conversation, just reply naturally."
@@ -1828,6 +1860,8 @@ class TaskProcessor:
                 f"Investigate with your tools, then produce a thorough internal"
                 f" draft. Tool actions appear on the Linear timeline as they"
                 f" run; a separate pass will write the user-facing reply.\n"
+                f"\n"
+                f"{HERMES_WORK_STYLE}\n"
                 f"\n"
                 f"Do what needs to be done. Use your tools and report what you"
                 f" actually did and found. If it's casual or needs discussion,"
@@ -2357,8 +2391,9 @@ class TaskProcessor:
             " or about to be taken.\n"
             "- Do not repeat or summarize tool actions from the timeline.\n"
             "- Do not use tools. Text output only.\n"
-            "- Preserve all facts and recommendations from the draft.\n"
-            "- If the draft is already a clean direct answer, return it trimmed."
+            "- If the draft is already a clean direct answer, return it trimmed.\n"
+            f"\n"
+            f"{HERMES_REPLY_STYLE}"
         )
 
     async def _call_llm_finalize(
