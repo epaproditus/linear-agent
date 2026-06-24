@@ -1985,6 +1985,7 @@ class TaskProcessor:
             return None
 
         last_thought_time = 0.0
+        last_drought_time = 0.0  # Independent timer for content-drought keepalives
         known_findings: set[str] = set()
         _last_checked_len = 0  # Track content already scanned for findings
         _last_emitted_pos = 0  # Track position of last emitted content
@@ -2174,13 +2175,13 @@ class TaskProcessor:
                             if (
                                 session_id
                                 and not content
-                                and now - last_thought_time > 5.0
+                                and now - last_drought_time > 5.0
                             ):
                                 if tracker:
                                     ctx = tracker.keepalive_context()
                                     if ctx:
                                         await progress_worker.put(ctx[:200])
-                                last_thought_time = now
+                                last_drought_time = now
 
                         # Final flush: emit remaining un-emitted content after stream ends
                         if tracker and _last_emitted_pos < len(accumulated):
