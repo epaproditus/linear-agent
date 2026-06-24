@@ -1096,8 +1096,6 @@ class DiscoveryTracker:
     _pending_tasks: list[asyncio.Task] = field(default_factory=list)
     _skip_texts: set = field(default_factory=set)
     """Texts already emitted by the tracker; LLM-streamed duplicates are suppressed."""
-    tool_progress_count: int = 0
-    """Hermes tool-progress activities emitted this session (excludes keepalive)."""
 
     MIN_ACTIVITY_INTERVAL: float = 0.8
     """Minimum seconds between any activity emission."""
@@ -1646,47 +1644,6 @@ def format_hermes_tool_progress(event: dict) -> str | None:
     return text
 
 
-# Opening lines the user already saw as tool-progress on the timeline.
-_INTENT_PREAMBLE_STARTS = (
-    "let me ", "i'll ", "i will ", "now let me ", "first, let me ",
-    "allow me to ", "i need to ", "i should ", "going to ",
-    "let's ", "we should ", "time to ",
-)
-
-
-def _strip_intent_preamble(text: str, had_tool_progress: bool) -> str:
-    """Drop 'Let me check…' openers when tool work was already shown live."""
-    if not had_tool_progress or not text:
-        return text
-
-    paragraphs = re.split(r"\n\s*\n", text.strip())
-    kept: list[str] = []
-    skipping = True
-    for para in paragraphs:
-        stripped = para.strip()
-        if not stripped:
-            continue
-        if skipping:
-            lower = stripped.lower()
-            is_intent = any(lower.startswith(s) for s in _INTENT_PREAMBLE_STARTS)
-            # Short planning-only paragraph with no finding markers
-            has_substance = any(
-                marker in lower
-                for marker in (
-                    "here's", "here is", "the issue", "root cause",
-                    "found ", "confirmed", "diagnosis", "summary",
-                    "answer:", "result:", "yes,", "no,", "**",
-                )
-            )
-            if is_intent and not has_substance and len(stripped) < 400:
-                continue
-            skipping = False
-        kept.append(stripped)
-
-    result = "\n\n".join(kept).strip()
-    return result if result else text
-
-
 # ── Task Processor ──────────────────────────────────────────────────────
 
 
@@ -1833,12 +1790,12 @@ class TaskProcessor:
                 f"{conversation_text}\n"
                 f"User: {user_request}\n"
                 f"\n"
-                f"The user already sees each tool action on the Linear"
-                f" timeline in real time (reads, searches, shell commands)."
-                f" Your final reply is the answer only — not a play-by-play."
-                f" Do not open with 'Let me...', 'I'll check...', or other"
-                f" planning language. Start directly with findings or a"
-                f" direct answer.\n"
+                f"Timeline vs answer: tool actions (reads, searches, shell)"
+                f" appear on the Linear timeline as they run. Your final"
+                f" message is conclusions only — not setup, not narration"
+                f" of what you are about to do.\n"
+                f"Bad opener: planning or process narration before findings.\n"
+                f"Good opener: the finding, answer, or decision itself.\n"
                 f"\n"
                 f"Respond to the new message. If it asks you to do something,"
                 f" do it now with your tools and report the result."
@@ -1869,12 +1826,12 @@ class TaskProcessor:
                 f"\n"
                 f"User: {user_request}\n"
                 f"\n"
-                f"The user already sees each tool action on the Linear"
-                f" timeline in real time (reads, searches, shell commands)."
-                f" Your final reply is the answer only — not a play-by-play."
-                f" Do not open with 'Let me...', 'I'll check...', or other"
-                f" planning language. Start directly with findings or a"
-                f" direct answer.\n"
+                f"Timeline vs answer: tool actions (reads, searches, shell)"
+                f" appear on the Linear timeline as they run. Your final"
+                f" message is conclusions only — not setup, not narration"
+                f" of what you are about to do.\n"
+                f"Bad opener: planning or process narration before findings.\n"
+                f"Good opener: the finding, answer, or decision itself.\n"
                 f"\n"
                 f"Do what needs to be done. Use your tools and report what you"
                 f" actually did and found. If it's casual or needs discussion,"
@@ -2149,10 +2106,6 @@ class TaskProcessor:
             # updates are visible in Linear before the final response.
             if tracker:
                 await tracker.flush()
-                response_text = _strip_intent_preamble(
-                    response_text,
-                    tracker.tool_progress_count > 0,
-                )
 
             await self.linear.send_response(session_id, response_text)
             # Task complete — move to "In Review" for the user
@@ -2277,7 +2230,6 @@ class TaskProcessor:
                                     seen_progress.add(discovery)
                                     tracker._keepalive_ctx = discovery[:100]
                                     tracker._skip_texts.add(discovery)
-                                    tracker.tool_progress_count += 1
                                     await progress_worker.put(discovery)
                                     log.info(
                                         "Hermes tool progress: %s",
