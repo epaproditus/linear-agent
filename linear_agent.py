@@ -2108,12 +2108,6 @@ class TaskProcessor:
                             content = delta.get("content", "")
                             if content:
                                 accumulated += content
-                                # Update keepalive context with latest content
-                                snippet = content.strip()[:100]
-                                # Skip meaningless fragments (punctuation, whitespace)
-                                sum_alnum = sum(c.isalnum() for c in snippet)
-                                if sum_alnum >= 2 and tracker:
-                                    tracker._keepalive_ctx = _strip_markdown(snippet)
 
                             now = time.monotonic()
 
