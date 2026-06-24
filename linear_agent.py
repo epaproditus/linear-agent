@@ -1295,13 +1295,70 @@ _CODE_MARKERS = (
     "asyncio.", "json.", "capture_output",
 )
 
+# Labels too vague or meta to show on the Linear timeline.
+_NOISE_LABELS = frozenset({
+    "fetching", "searching web", "searching", "browsing", "running",
+    "hermes tool progress", "working on it", "*.log", "*.log'",
+})
+
 
 def _normalize_progress_markdown(text: str) -> str:
     """Strip markdown Hermes or upstream clients may have injected."""
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"__(.+?)__", r"\1", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_noise_label(label: str) -> bool:
+    lower = label.lower().strip()
+    if lower in _NOISE_LABELS:
+        return True
+    if lower in _HERMES_TOOL_VERBS.values():
+        return True
+    if lower in _HERMES_TOOL_VERBS:
+        return True
+    return lower in ("log", "*.log")
+
+
+def _is_url(text: str) -> bool:
+    t = text.strip().lower()
+    return t.startswith("http://") or t.startswith("https://")
+
+
+def _summarize_url(url: str) -> str:
+    lower = url.lower()
+    if "hermes-agent.nousresearch.com" in lower:
+        if "api-server" in lower:
+            return "Read Hermes API server docs"
+        return "Read Hermes documentation"
+    if "github.com" in lower:
+        issue = re.search(r"/issues/(\d+)", url)
+        if issue:
+            return f"Checked GitHub issue #{issue.group(1)}"
+        pr = re.search(r"/pull/(\d+)", url)
+        if pr:
+            return f"Reviewed GitHub PR #{pr.group(1)}"
+        return "Opened GitHub link"
+    return "Fetched web page"
+
+
+def _summarize_pipe_pattern(text: str) -> str:
+    """Turn grep-style alternation patterns into one readable line."""
+    parts = [
+        p.strip().strip("\\")
+        for p in text.split("|")
+        if p.strip() and p.strip().lower() not in _NOISE_LABELS
+    ]
+    if not parts:
+        return "Searched the codebase"
+    if len(parts) == 1:
+        return f"Searched for `{parts[0][:45]}`"
+    shown = ", ".join(f"`{p[:28]}`" for p in parts[:3])
+    if len(parts) > 3:
+        return f"Searched for {shown} and {len(parts) - 3} more"
+    return f"Searched for {shown}"
 
 
 def _looks_like_code(text: str) -> bool:
@@ -1323,6 +1380,11 @@ def _looks_like_path(text: str) -> bool:
 def _is_repo_slug(text: str) -> bool:
     t = text.strip()
     return bool(re.fullmatch(r"[\w][\w.-]{0,48}", t)) and " " not in t
+
+
+def _is_bare_symbol(text: str) -> bool:
+    t = text.strip()
+    return bool(re.fullmatch(r"_?[\w]+", t)) and len(t) >= 4
 
 
 def _basename(path: str) -> str:
@@ -1347,12 +1409,8 @@ def _summarize_code_label(label: str) -> str | None:
         return "Reviewed latest commit"
     if "git" in lower and "diff" in lower:
         return "Compared code changes"
-    if "grep" in lower or "rg " in lower:
-        patterns = re.findall(r"""['"]([^'"]{3,60})['"]""", label)
-        for pat in patterns:
-            if pat not in (".", "..") and not pat.startswith("/"):
-                return f"Searched for `{pat}`"
-        return "Searched the codebase"
+    if "grep" in lower or "rg " in lower or "|" in label:
+        return _summarize_pipe_pattern(label)
     if "read" in lower and ("_call_llm" in label or "progress" in lower):
         return "Read progress parsing code in linear_agent.py"
     if "subprocess" in lower:
@@ -1360,20 +1418,114 @@ def _summarize_code_label(label: str) -> str | None:
     return "Ran script"
 
 
+def _extract_finding_from_output(
+    tool: str, output: str, label: str, args: dict[str, Any],
+) -> str | None:
+    """Mine a completed tool's output for a user-visible finding."""
+    output = output.strip()
+    if not output or len(output) < 2:
+        return None
+
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    non_empty = lines[:20]
+
+    if tool in ("grep", "search_files") or "grep" in label.lower():
+        file_hits: dict[str, int] = {}
+        symbols: list[str] = []
+        for ln in non_empty:
+            m = re.match(r"^([^:]+):(\d+):?(.*)$", ln)
+            if m:
+                fname = _basename(m.group(1))
+                file_hits[fname] = file_hits.get(fname, 0) + 1
+                sym = (m.group(3) or "").strip()
+                if sym and len(sym) < 60:
+                    symbols.append(sym)
+            elif ln and not ln.startswith("Binary"):
+                symbols.append(ln[:60])
+        if file_hits:
+            top = max(file_hits, key=file_hits.get)
+            total = sum(file_hits.values())
+            if symbols and len(symbols) == 1:
+                sym = symbols[0].removeprefix("def ").strip()
+                return f"Found `{sym}` in `{top}`"
+            return f"Found {total} matches in `{top}`"
+        if non_empty:
+            return f"Found {len(non_empty)} search results"
+
+    if tool == "read_file" or (tool == "terminal" and _looks_like_path(label)):
+        path = str(args.get("path") or label or "file")
+        base = _basename(path) if path else "file"
+        line_count = output.count("\n") + 1
+        return f"Read `{base}` ({line_count} lines)"
+
+    if tool == "terminal":
+        lower_label = label.lower()
+        if "git log" in lower_label or any(
+            re.match(r"^[0-9a-f]{7,}\s", ln) for ln in non_empty[:3]
+        ):
+            count = sum(
+                1 for ln in non_empty if re.match(r"^[0-9a-f]{7,}\s", ln)
+            )
+            return f"Found {count or len(non_empty)} recent commits"
+        if "git show" in lower_label or "git diff" in lower_label:
+            return "Reviewed latest commit changes"
+        if len(non_empty) == 1 and len(non_empty[0]) <= 80:
+            return f"Got `{non_empty[0]}`"
+        if non_empty:
+            preview = non_empty[0][:60]
+            return f"Command returned: `{preview}`"
+
+    if tool == "web_search":
+        if non_empty:
+            return f"Found {len(non_empty)} web results"
+        return None
+
+    if tool == "web_extract":
+        if len(output) > 100:
+            return f"Fetched page ({len(output)} chars)"
+        return None
+
+    if tool == "execute_code" and non_empty:
+        preview = non_empty[0][:60]
+        return f"Script output: `{preview}`"
+
+    return None
+
+
 def _beautify_progress_text(
     tool: str, label: str, args: dict[str, Any],
 ) -> str | None:
     """Convert raw Hermes labels into short, consistent timeline prose."""
     label = _normalize_progress_markdown(label)
+    if label.lower().startswith("found "):
+        label = label[6:].strip()
+
     if not label:
         return _format_hermes_tool_fallback(tool, args)
 
-    if _is_repo_slug(label) and tool in ("terminal", "execute_code", "browser"):
+    if _is_noise_label(label):
+        return None
+
+    if _is_url(label):
+        return _summarize_url(label)
+
+    if "|" in label and len(label) < 140:
+        return _summarize_pipe_pattern(label)
+
+    if _is_bare_symbol(label):
+        return f"Found `{label}`"
+
+    if _is_repo_slug(label) and tool not in ("terminal", "execute_code", "browser"):
+        return None
+
+    if _is_repo_slug(label):
         return f"Working in `{label}`"
 
     if _looks_like_path(label):
         base = _basename(label)
-        if tool == "read_file" or base.endswith((".py", ".md", ".json", ".yaml", ".yml", ".toml")):
+        if base.startswith(".") or base.endswith(
+            (".py", ".md", ".json", ".yaml", ".yml", ".toml", ".env", ".example")
+        ):
             return f"Read `{base}`"
         return f"Opened `{base}`"
 
@@ -1387,13 +1539,16 @@ def _beautify_progress_text(
     if tool == "terminal" and len(label) <= 72 and not _looks_like_code(label):
         return f"Ran `{label}`"
 
-    if tool == "web_search" and len(label) <= 80:
+    if tool == "web_search" and len(label) <= 80 and not _is_url(label):
         return f"Searched web for `{label}`"
+
+    if tool == "web_extract" and _is_url(label):
+        return _summarize_url(label)
 
     if len(label) <= 80 and not _looks_like_code(label):
         return label
 
-    return _format_hermes_tool_fallback(tool, args) or label[:80]
+    return _format_hermes_tool_fallback(tool, args) or None
 
 
 def _parse_hermes_tool_args(event: dict) -> dict[str, Any]:
@@ -1452,8 +1607,8 @@ def format_hermes_tool_progress(event: dict) -> str | None:
     """Convert a hermes.tool.progress SSE payload to Linear timeline text.
 
     Hermes runs tools server-side and emits progress on a custom SSE channel
-    separate from assistant response tokens, so timeline updates never
-    duplicate the final answer.
+    separate from assistant response tokens. Completed events with output are
+    preferred over running start events when a toolCallId is present.
     """
     tool = (event.get("tool") or event.get("name") or "").strip()
     if not tool or tool.startswith(_HERMES_INTERNAL_TOOL_PREFIX):
@@ -1465,23 +1620,26 @@ def format_hermes_tool_progress(event: dict) -> str | None:
 
     label = (event.get("label") or "").strip()
     args = _parse_hermes_tool_args(event)
+
+    output_raw = event.get("output") or event.get("result")
+    if isinstance(output_raw, dict):
+        output_text = json.dumps(output_raw, ensure_ascii=False)
+    elif isinstance(output_raw, str):
+        output_text = output_raw
+    else:
+        output_text = ""
+
+    if status == "completed" and output_text:
+        finding = _extract_finding_from_output(
+            tool, output_text, label, args,
+        )
+        if finding:
+            return finding
+
     if label or args:
         text = _beautify_progress_text(tool, label, args)
     else:
         text = _format_hermes_tool_fallback(tool, args)
-    if not text:
-        return None
-
-    if status == "completed":
-        output = event.get("output") or event.get("result")
-        if isinstance(output, dict):
-            output = json.dumps(output, ensure_ascii=False)
-        if isinstance(output, str):
-            preview = _normalize_progress_markdown(output)[:60]
-            if preview and len(preview) > 12 and preview not in text:
-                if tool in ("grep", "search_files", "terminal"):
-                    return f"{text} — found results"
-                return text
 
     return text
 
@@ -2018,6 +2176,20 @@ class TaskProcessor:
 
                         current_event = ""
                         seen_progress: set[str] = set()
+                        seen_repos: set[str] = set()
+
+                        def _should_emit_progress(text: str) -> bool:
+                            key = _normalize_progress_markdown(text).lower()
+                            if key in seen_progress:
+                                return False
+                            if text.startswith("Working in `"):
+                                repo = text[12:].rstrip("`")
+                                if repo in seen_repos:
+                                    return False
+                                seen_repos.add(repo)
+                            seen_progress.add(key)
+                            seen_progress.add(text)
+                            return True
 
                         async for line in resp.aiter_lines():
                             line = line.strip()
@@ -2045,7 +2217,7 @@ class TaskProcessor:
                                     discovery
                                     and tracker
                                     and progress_worker
-                                    and discovery not in seen_progress
+                                    and _should_emit_progress(discovery)
                                 ):
                                     seen_progress.add(discovery)
                                     tracker._keepalive_ctx = discovery[:100]
