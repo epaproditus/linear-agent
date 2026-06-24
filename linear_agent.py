@@ -98,6 +98,8 @@ Reply style (Linear issue comment — user already saw tool progress on the time
 _PLAN_PENDING = "pending"
 _PLAN_ACTIVE = "inProgress"
 _PLAN_DONE = "completed"
+PLAN_STEP_MAX_LEN = 48
+PLAN_MAX_STEPS = 5
 
 # ── Rate Limiting ──
 MAX_CONCURRENT_SESSIONS = 10    # Max concurrent LLM session handlers
@@ -1258,7 +1260,12 @@ class SessionPlanTracker:
 
     async def set_from_hermes(self, step_texts: list[str]) -> None:
         """Apply Hermes-authored plan steps; first step is in progress."""
-        texts = [t.strip()[:200] for t in step_texts if t.strip()][:7]
+        texts = [
+            _shorten_plan_step(t)
+            for t in step_texts
+            if t.strip()
+        ]
+        texts = [t for t in texts if t][:PLAN_MAX_STEPS]
         if len(texts) < 2:
             return
         self.steps = [
@@ -1319,6 +1326,31 @@ def _parse_hermes_plan_json(text: str) -> list[str]:
                             out.append(str(label).strip())
                 return [s for s in out if s]
     return []
+
+
+def _shorten_plan_step(text: str, max_len: int = PLAN_STEP_MAX_LEN) -> str:
+    """Compress a plan step to a short checklist label."""
+    t = _normalize_progress_markdown(text.strip())
+    t = re.sub(
+        r"^(?:i will |i'll |we need to |need to |first,? |then,? |next,? )+",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"^(?:read the |check the |review the |search for the )", "", t, flags=re.IGNORECASE)
+    t = re.sub(
+        r"\b(?:carefully|thoroughly|completely|in order to|so that|in order)\b",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"\s+", " ", t).strip(" ,;.-")
+    if not t:
+        return ""
+    if len(t) <= max_len:
+        return t[0].upper() + t[1:] if t else t
+    cut = t[: max_len - 1].rsplit(" ", 1)[0]
+    return (cut or t[: max_len - 1]) + "…"
 
 
 class ProgressQueueWorker:
@@ -2024,12 +2056,14 @@ class TaskProcessor:
             f"{skills_block}"
             f"User request:\n{user_request}\n"
             "\n"
-            "Return 3–7 concrete investigation steps specific to this issue.\n"
-            "Each step is an action you will perform (read file, search, run"
-            " command, verify fix, etc.) — not generic labels.\n"
+            "Return 3–5 terse checklist steps for this issue.\n"
+            "Each step: max 8 words, imperative, no full sentences.\n"
+            "Style: verb + object — like 'Read linear_agent.py',"
+            " 'Grep hermes.tool.progress', 'Check phase-2 summary'.\n"
+            "No explanations, sub-clauses, or 'in order to' phrasing.\n"
             "Do not include 'write final answer' — that is implicit.\n"
             "\n"
-            'Respond with JSON only: {"steps": ["step one", "step two", ...]}'
+            'Respond with JSON only: {"steps": ["...", "..."]}'
         )
 
     async def _call_llm_plan(
@@ -2064,7 +2098,7 @@ class TaskProcessor:
                         "model": settings.hermes_model,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.2,
-                        "max_tokens": 500,
+                        "max_tokens": 256,
                         "stream": False,
                         "stream_tool_progress": False,
                     },
@@ -2078,10 +2112,11 @@ class TaskProcessor:
                     .get("message", {})
                     .get("content", "")
                 )
-                steps = _parse_hermes_plan_json(content or "")
+                steps = [_shorten_plan_step(s) for s in _parse_hermes_plan_json(content or "")]
+                steps = [s for s in steps if s][:PLAN_MAX_STEPS]
                 if len(steps) >= 2:
                     log.info("Hermes plan: %d steps for %s", len(steps), identifier)
-                    return steps[:7]
+                    return steps
                 log.warning("Plan call: unparseable or too few steps")
                 return []
         except Exception:
