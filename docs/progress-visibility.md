@@ -31,6 +31,14 @@ There are three sources of progress updates:
 The final answer is emitted once via `send_response()` — never streamed
 into the timeline.
 
+## Two-phase response (robust)
+
+When tool progress was emitted during phase 1, a second non-streaming
+Hermes call rewrites the internal draft as a conclusions-only reply.
+Phase 2 receives the timeline steps already shown and the phase-1 draft;
+it does not re-run tools. If phase 2 fails, the phase-1 draft is sent as
+a fallback.
+
 ## What You'll See (Typical Timeline)
 
 ```

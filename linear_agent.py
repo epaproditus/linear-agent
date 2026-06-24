@@ -1096,6 +1096,8 @@ class DiscoveryTracker:
     _pending_tasks: list[asyncio.Task] = field(default_factory=list)
     _skip_texts: set = field(default_factory=set)
     """Texts already emitted by the tracker; LLM-streamed duplicates are suppressed."""
+    tool_progress: list[str] = field(default_factory=list)
+    """Tool-progress lines emitted to the timeline this session (for phase-2 summary)."""
 
     MIN_ACTIVITY_INTERVAL: float = 0.8
     """Minimum seconds between any activity emission."""
@@ -1790,12 +1792,9 @@ class TaskProcessor:
                 f"{conversation_text}\n"
                 f"User: {user_request}\n"
                 f"\n"
-                f"Timeline vs answer: tool actions (reads, searches, shell)"
-                f" appear on the Linear timeline as they run. Your final"
-                f" message is conclusions only — not setup, not narration"
-                f" of what you are about to do.\n"
-                f"Bad opener: planning or process narration before findings.\n"
-                f"Good opener: the finding, answer, or decision itself.\n"
+                f"Investigate with your tools, then produce a thorough internal"
+                f" draft. Tool actions appear on the Linear timeline as they"
+                f" run; a separate pass will write the user-facing reply.\n"
                 f"\n"
                 f"Respond to the new message. If it asks you to do something,"
                 f" do it now with your tools and report the result."
@@ -1826,12 +1825,9 @@ class TaskProcessor:
                 f"\n"
                 f"User: {user_request}\n"
                 f"\n"
-                f"Timeline vs answer: tool actions (reads, searches, shell)"
-                f" appear on the Linear timeline as they run. Your final"
-                f" message is conclusions only — not setup, not narration"
-                f" of what you are about to do.\n"
-                f"Bad opener: planning or process narration before findings.\n"
-                f"Good opener: the finding, answer, or decision itself.\n"
+                f"Investigate with your tools, then produce a thorough internal"
+                f" draft. Tool actions appear on the Linear timeline as they"
+                f" run; a separate pass will write the user-facing reply.\n"
                 f"\n"
                 f"Do what needs to be done. Use your tools and report what you"
                 f" actually did and found. If it's casual or needs discussion,"
@@ -2092,8 +2088,7 @@ class TaskProcessor:
         )
 
         try:
-            # Call LLM for reasoning with discovery extraction
-            response_text = await self._call_llm(prompt, session_id, tracker)
+            draft_text = await self._call_llm(prompt, session_id, tracker)
         finally:
             keepalive_task.cancel()
             try:
@@ -2101,11 +2096,28 @@ class TaskProcessor:
             except asyncio.CancelledError:
                 pass
 
-        if response_text:
-            # Flush pending thought activities so all intermediate progress
-            # updates are visible in Linear before the final response.
+        if draft_text:
             if tracker:
                 await tracker.flush()
+
+            response_text = draft_text
+            if tracker and tracker.tool_progress:
+                finalized = await self._call_llm_finalize(
+                    draft=draft_text,
+                    user_request=user_request,
+                    tool_progress=tracker.tool_progress,
+                    session_id=session_id,
+                )
+                if finalized:
+                    response_text = finalized
+                    log.info(
+                        "Phase-2 summary: draft_len=%d final_len=%d tool_steps=%d",
+                        len(draft_text), len(response_text), len(tracker.tool_progress),
+                    )
+                else:
+                    log.warning(
+                        "Phase-2 summary failed; sending phase-1 draft",
+                    )
 
             await self.linear.send_response(session_id, response_text)
             # Task complete — move to "In Review" for the user
@@ -2230,6 +2242,7 @@ class TaskProcessor:
                                     seen_progress.add(discovery)
                                     tracker._keepalive_ctx = discovery[:100]
                                     tracker._skip_texts.add(discovery)
+                                    tracker.tool_progress.append(discovery)
                                     await progress_worker.put(discovery)
                                     log.info(
                                         "Hermes tool progress: %s",
@@ -2314,6 +2327,91 @@ class TaskProcessor:
         if progress_worker:
             await progress_worker.drain_and_stop()
         return None
+
+    def _build_finalize_prompt(
+        self,
+        draft: str,
+        user_request: str,
+        tool_progress: list[str],
+    ) -> str:
+        """Phase-2 prompt: rewrite investigation draft as conclusions-only reply."""
+        timeline = "\n".join(f"- {line}" for line in tool_progress[:25])
+        return (
+            "You are Hermes, writing the final reply on a Linear issue.\n"
+            "\n"
+            "The investigation is complete. Tool actions below were already"
+            " shown live on the issue timeline. The user read them while you"
+            " worked. Your job now is ONLY the final written answer.\n"
+            "\n"
+            f"Timeline already shown to the user:\n{timeline}\n"
+            "\n"
+            f"User question:\n{user_request}\n"
+            "\n"
+            "Internal draft (may include process narration mixed with findings):\n"
+            f"---\n{draft}\n"
+            "---\n"
+            "\n"
+            "Write the final user-facing reply.\n"
+            "- Conclusions, findings, decisions, and direct answers only.\n"
+            "- No process narration: do not describe steps taken, planned,"
+            " or about to be taken.\n"
+            "- Do not repeat or summarize tool actions from the timeline.\n"
+            "- Do not use tools. Text output only.\n"
+            "- Preserve all facts and recommendations from the draft.\n"
+            "- If the draft is already a clean direct answer, return it trimmed."
+        )
+
+    async def _call_llm_finalize(
+        self,
+        draft: str,
+        user_request: str,
+        tool_progress: list[str],
+        session_id: str = "",
+    ) -> str | None:
+        """Phase 2: non-streaming rewrite — conclusions only, no tool re-run."""
+        if not settings.hermes_api_key or not draft.strip():
+            return None
+
+        prompt = self._build_finalize_prompt(draft, user_request, tool_progress)
+        headers = {
+            "Authorization": f"Bearer {settings.hermes_api_key}",
+            "Content-Type": "application/json",
+        }
+        if session_id:
+            headers["X-Hermes-Session-Id"] = f"{session_id}:finalize"
+
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.post(
+                    f"{settings.hermes_api_url}/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": settings.hermes_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.3,
+                        "max_tokens": 2000,
+                        "stream": False,
+                        "stream_tool_progress": False,
+                    },
+                )
+                if resp.status_code != 200:
+                    log.warning(
+                        "Phase-2 summary: Hermes API returned %d",
+                        resp.status_code,
+                    )
+                    return None
+                data = resp.json()
+                choices = data.get("choices", [])
+                if not choices:
+                    return None
+                content = choices[0].get("message", {}).get("content", "")
+                result = content.strip() if content else None
+                if result:
+                    log.info("Phase-2 summary succeeded: len=%d", len(result))
+                return result
+        except Exception:
+            log.warning("Phase-2 summary failed", exc_info=True)
+            return None
 
     async def _keep_session_alive(self, session_id: str, tracker: DiscoveryTracker | None = None) -> None:
         """Periodically emit ephemeral thoughts to keep the session alive
