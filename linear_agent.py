@@ -1315,7 +1315,7 @@ def _is_noise_label(label: str) -> bool:
     lower = label.lower().strip()
     if lower in _NOISE_LABELS:
         return True
-    if lower in _HERMES_TOOL_VERBS.values():
+    if lower in {v.lower() for v in _HERMES_TOOL_VERBS.values()}:
         return True
     if lower in _HERMES_TOOL_VERBS:
         return True
