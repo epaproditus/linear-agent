@@ -108,7 +108,8 @@ The agent emits typed activities to the session for transparency:
 
 ```
 /home/abe/linear-agent/
-├── linear_agent.py              # Main application (1875 lines)
+├── linear_agent.py              # Linear agent (port 8660)
+├── plane_agent.py               # Plane agent (port 8648)
 ├── pyproject.toml               # Project metadata & dependencies
 ├── requirements.txt             # Python dependencies (legacy)
 ├── .env.example                 # Configuration template
@@ -117,6 +118,11 @@ The agent emits typed activities to the session for transparency:
 ├── bin/
 │   ├── linear-agent-wrapper.sh  # Wrapper with systemd-notify watchdog
 │   └── update-service.sh        # Install/update systemd unit
+├── tests/                       # Test suite
+│   └── test_pr_urls.py
+├── scripts/                     # Utility scripts
+├── docs/                        # Documentation and reports
+├── plans/                       # Implementation plans
 └── reports/                     # Analysis reports
 ```
 
@@ -194,4 +200,83 @@ bash bin/linear-agent-wrapper.sh
 
 - [Hermes Agent](https://hermes-agent.nousresearch.com) — The AI agent framework powering this
 - [Linear Agent Session API](https://developers.linear.app/docs/agent/agent-sessions) — Linear's agent integration docs
-- [Plane Agent](https://plane.epaphrodit.us) — Companion project management agent
+- [Plane Agents](https://developers.plane.so/dev-tools/agents/building-an-agent) — Plane's agent integration docs
+
+## Plane Agent
+
+A companion Plane agent runs on port **8648**. It mirrors the Linear agent's architecture but uses Plane's REST API instead of Linear's GraphQL.
+
+### Architecture
+
+```
+Plane Webhook ──POST──► FastAPI (port 8648)
+                              │
+                     ┌───────┴───────┐
+                     │  HMAC verify   │
+                     │  Rate limiter  │
+                     └───────┬───────┘
+                             │
+                     ┌───────┴───────┐
+                     │  Event Router │
+                     └───────┬───────┘
+                             │
+                     ┌───────┴───────┐
+                     │ TaskProcessor  │
+                     │  (asyncio)     │
+                     └───────┬───────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+        Plane REST API  Hermes API    DiscoveryTracker
+        (activities,   (LLM reasoning) (progress updates)
+         work items,
+         comments)
+```
+
+### Key Differences from Linear Agent
+
+| Aspect | Linear Agent | Plane Agent |
+|--------|-------------|-------------|
+| API style | GraphQL (api.linear.app/graphql) | REST (api.plane.so/api/v1/) |
+| Port | 8660 | 8648 |
+| Auth | OAuth token | Bot token (Bearer) |
+| Entity | AgentSession | AgentRun |
+| Activity | AgentActivityCreate mutation | POST /agent-runs/{id}/activities/ |
+| Workspace | Team-based routing | Workspace slug required in URL |
+| Issue naming | Issues | Work Items |
+| SDK | None (raw GraphQL) | plane-sdk (pip install plane-sdk) |
+
+### Setup
+
+1. Create an OAuth app in Plane with **Enable App Mentions** and **Agent Run** scopes
+2. Complete the Bot Token Flow to get your bot token
+3. Configure the agent via `.env`:
+   ```
+   PLANE_API_KEY=<bot_token>
+   PLANE_WEBHOOK_SECRET=<webhook_secret>
+   PLANE_WORKSPACE_SLUG=epaphroditus
+   ```
+4. Start the agent:
+   ```bash
+   uvicorn plane_agent:app --host 0.0.0.0 --port 8648
+   ```
+
+### Webhooks
+
+The agent handles two webhook events:
+- **agent_run** (action: created) — New agent run when user @-mentions the agent
+- **agent_run_activity** (action: prompted) — Follow-up message in an existing run
+
+Activities are created using Plane's REST API at:
+```
+POST /api/v1/workspaces/{slug}/agent-runs/{run_id}/activities/
+```
+
+### Implementation Notes
+
+- Uses `httpx` AsyncClient for REST calls (same dependency as Linear agent)
+- Activity types: thought, action, response, error, elicitation
+- Supports ephemeral activities (thought, action) for progress visibility
+- Accepts both `X-Plane-Signature` and `X-Hub-Signature-256` webhook headers
+- Workspace slug is resolved from config or fetched from Plane API
+- Can target self-hosted Plane instances via `PLANE_API_URL`
