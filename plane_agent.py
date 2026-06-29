@@ -153,6 +153,9 @@ class Settings(BaseSettings):
     plane_redirect_uri: str = ""
     """OAuth redirect URI registered in Plane. Defaults to {PLANE_PUBLIC_URL}/oauth/callback."""
 
+    plane_scopes: str = "agents.runs:read agents.runs:write agents.run_activities:read agents.run_activities:write"
+    """OAuth scopes to request for agent capabilities. Defaults to all four Agent Run scopes."""
+
     hermes_api_url: str = "http://127.0.0.1:8642/v1"
     """Hermes API server URL for LLM reasoning."""
 
@@ -167,7 +170,7 @@ class Settings(BaseSettings):
         if self.plane_redirect_uri:
             return self.plane_redirect_uri
         if self.plane_public_url:
-            return f"{self.plane_public_url.rstrip('/')}/oauth/callback"
+            return f"{self.plane_public_url.rstrip('/')}/plane/oauth/callback"
         return ""
 
     @property
@@ -645,15 +648,18 @@ def build_plane_consent_url(
     *,
     client_id: str,
     redirect_uri: str,
+    scopes: str = "",
     api_url: str = PLANE_API_URL_DEFAULT,
 ) -> str:
     """Build Plane's OAuth consent URL for app installation."""
-    params = urlencode({
+    params: dict[str, str] = {
         "client_id": client_id,
         "response_type": "code",
         "redirect_uri": redirect_uri,
-    })
-    return f"{api_url.rstrip('/')}/auth/o/authorize-app/?{params}"
+    }
+    if scopes:
+        params["scope"] = scopes
+    return f"{api_url.rstrip('/')}/auth/o/authorize-app/?{urlencode(params)}"
 
 
 async def exchange_bot_token(
@@ -661,11 +667,19 @@ async def exchange_bot_token(
     client_id: str,
     client_secret: str,
     app_installation_id: str,
+    scopes: str = "",
     api_url: str = PLANE_API_URL_DEFAULT,
 ) -> dict[str, Any]:
     """Exchange an app installation ID for a bot token (client credentials flow)."""
     credentials = f"{client_id}:{client_secret}"
     encoded = base64.b64encode(credentials.encode()).decode()
+
+    data: dict[str, str] = {
+        "grant_type": "client_credentials",
+        "app_installation_id": app_installation_id,
+    }
+    if scopes:
+        data["scope"] = scopes
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
@@ -674,11 +688,7 @@ async def exchange_bot_token(
                 "Authorization": f"Basic {encoded}",
                 "Content-Type": "application/x-www-form-urlencoded",
             },
-            data={
-                "grant_type": "client_credentials",
-                "app_installation_id": app_installation_id,
-                "scope": "read write",
-            },
+            data=data,
         )
         if resp.status_code != 200:
             raise RuntimeError(
@@ -2018,6 +2028,7 @@ async def plane_install() -> RedirectResponse:
     consent_url = build_plane_consent_url(
         client_id=settings.plane_client_id,
         redirect_uri=settings.effective_redirect_uri,
+        scopes=settings.plane_scopes,
         api_url=settings.plane_api_url,
     )
     log.info("Redirecting to Plane OAuth consent screen")
@@ -2044,6 +2055,7 @@ async def plane_oauth_callback(
             client_id=settings.plane_client_id,
             client_secret=settings.plane_client_secret,
             app_installation_id=app_installation_id,
+            scopes=settings.plane_scopes,
             api_url=settings.plane_api_url,
         )
     except RuntimeError as e:
@@ -2159,7 +2171,7 @@ async def setup_page(request: Request) -> Response:
         f"?client_id={settings.plane_client_id}"
         f"&response_type=code"
         f"&redirect_uri={quote(settings.effective_redirect_uri)}"
-        f"&scope=Agent%20Run"
+        f"&scope={quote(settings.plane_scopes)}"
     ) if settings.oauth_install_ready else ""
 
     if settings.oauth_install_ready and not code:
