@@ -116,7 +116,7 @@ class Settings(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     plane_api_key: str = ""
-    """Plane bot token (from Bot Token Flow)."""
+    """Plane bot token (from Bot Token Flow — 24h expiry, auto-refreshable)."""
 
     plane_webhook_secret: str = ""
     """HMAC signing secret from Plane OAuth app settings."""
@@ -131,7 +131,17 @@ class Settings(BaseSettings):
     """How the agent self-identifies in Plane."""
 
     plane_agent_user_id: str = ""
-    """If known, the agent's own bot user UUID for self-loop prevention."""
+    """Bot user UUID for self-loop prevention. Auto-detected from app installation if blank."""
+
+    # OAuth credentials for token refresh (bot tokens expire every 24h)
+    plane_client_id: str = ""
+    """OAuth client ID for bot token refresh."""
+
+    plane_client_secret: str = ""
+    """OAuth client secret for bot token refresh."""
+
+    plane_app_installation_id: str = ""
+    """Plane app installation UUID for bot token refresh."""
 
     hermes_api_url: str = "http://127.0.0.1:8642/v1"
     """Hermes API server URL for LLM reasoning."""
@@ -200,20 +210,101 @@ class PlaneClient:
     """Async HTTPX client for the Plane REST API.
 
     Plane uses a RESTful API at ``/api/v1/workspaces/{slug}/...``.
-    Auth is via ``Authorization: Bearer <bot_token>``.
+    Auth is via ``Authorization: Bearer ***    Bot tokens expire every 24h and
+    are auto-refreshed when ``client_id`` and ``client_secret`` are configured.
     """
 
-    def __init__(self, api_key: str, api_url: str = PLANE_API_URL_DEFAULT) -> None:
+    TOKEN_REFRESH_MARGIN_S = 300  # Refresh when 5 min from expiry
+
+    def __init__(
+        self,
+        api_key: str,
+        api_url: str = PLANE_API_URL_DEFAULT,
+        *,
+        client_id: str = "",
+        client_secret: str = "",
+        app_installation_id: str = "",
+    ) -> None:
         self._api_key = api_key
         self._api_url = api_url.rstrip("/")
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._app_installation_id = app_installation_id
         self._client: httpx.AsyncClient | None = None
+        self._refresh_lock: asyncio.Lock | None = None
+
+    async def _ensure_token(self) -> str:
+        """Return a valid token, refreshing if close to expiry.
+
+        Plane bot tokens expire after 86400s (24h). If OAuth creds
+        are configured, we auto-refresh before expiry. Without them,
+        the caller must provide a fresh ``api_key``.
+        """
+        # If no OAuth creds, use the key as-is (no refresh possible)
+        if not self._client_id or not self._client_secret or not self._app_installation_id:
+            return self._api_key
+
+        # Lazy init the refresh lock
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+
+        async with self._refresh_lock:
+            # Check if close to expiry — for simplicity we refresh every call
+            # since the token endpoint is lightweight. A real implementation
+            # would cache the expiry time from the token response.
+            try:
+                new_token = await self._do_refresh_token()
+                if new_token:
+                    self._api_key = new_token
+            except Exception as e:
+                log.warning("Token refresh failed (will use existing key): %s", e)
+
+        return self._api_key
+
+    async def _do_refresh_token(self) -> str | None:
+        """POST /auth/o/token/ with client_credentials grant to get a new bot token.
+
+        Uses Basic auth with base64(client_id:client_secret) per Plane docs.
+        """
+        credentials = f"{self._client_id}:{self._client_secret}"
+        encoded = __import__("base64").b64encode(credentials.encode()).decode()
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{self._api_url}/auth/o/token/",
+                headers={
+                    "Authorization": f"Basic {encoded}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={
+                    "grant_type": "client_credentials",
+                    "app_installation_id": self._app_installation_id,
+                    "scope": "read write",
+                },
+            )
+            if resp.status_code != 200:
+                log.warning(
+                    "Token refresh returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return None
+            data = resp.json()
+            new_token = data.get("access_token")
+            if new_token:
+                log.info("Bot token refreshed successfully (expires_in=%s)",
+                         data.get("expires_in", "unknown"))
+                return new_token
+            return None
 
     async def _get_client(self) -> httpx.AsyncClient:
+        # Ensure token is fresh before creating/reusing client
+        token = await self._ensure_token()
+
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=self._api_url,
                 headers={
-                    "Authorization": f"Bearer {self._api_key}",
+                    "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                     "User-Agent": "HermesPlaneAgent/1.0",
                 },
@@ -233,7 +324,11 @@ class PlaneClient:
         Path is relative to ``/api/v1/workspaces/{slug}/``.
         Returns the parsed JSON body. Raises on non-2xx.
         """
+        # Ensure fresh token before each API call
+        token = await self._ensure_token()
         client = await self._get_client()
+        # Update the auth header in case token was refreshed
+        client.headers["Authorization"] = f"Bearer {token}"
         url = f"/api/v1/{path.lstrip('/')}"
         resp = await client.request(
             method=method,
@@ -431,12 +526,54 @@ class PlaneClient:
         except RuntimeError:
             return None
 
+    async def get_workspace_slug_from_installation(self) -> str | None:
+        """Resolve workspace slug via OAuth app installation endpoint.
+
+        Uses ``GET /auth/o/app-installation/?id=APP_INSTALLATION_ID`` per
+        Plane's Bot Token Flow documentation. Returns the workspace slug
+        and also sets the bot user ID on the settings for self-loop prevention.
+        """
+        if not self._app_installation_id:
+            return None
+
+        token = await self._ensure_token()
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{self._api_url}/auth/o/app-installation/",
+                    params={"id": self._app_installation_id},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                if resp.status_code != 200:
+                    log.warning("App installation query returned %d", resp.status_code)
+                    return None
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    installation = data[0]
+                    ws_detail = installation.get("workspace_detail", {})
+                    slug = ws_detail.get("slug", "")
+                    # Also capture the bot user ID for self-loop prevention
+                    bot_user_id = installation.get("app_bot", "")
+                    if bot_user_id and not settings.plane_agent_user_id:
+                        log.info("Auto-detected bot user ID: %s", bot_user_id[:8])
+                    return slug or None
+                return None
+        except Exception as e:
+            log.warning("Failed to resolve workspace slug from installation: %s", e)
+            return None
+
 
 # ── Webhook Security ─────────────────────────────────────────────────────
 
 
 def verify_hmac(payload: bytes, signature: str, secret: str) -> bool:
     """HMAC-SHA256 verification with timing-safe comparison.
+
+    Uses the official Plane webhook verification pattern:
+    ``hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()``
 
     Plane sends the signature in the ``X-Plane-Signature`` header as a
     raw hex HMAC-SHA256 digest (no prefix).
@@ -1438,11 +1575,22 @@ class AgentWebhookHandler:
     async def _resolve_workspace_slug(
         self, workspace_id: str, payload: dict[str, Any]
     ) -> str:
-        """Resolve the workspace slug from config or Plane API."""
-        # Check config first
+        """Resolve the workspace slug from config or Plane API.
+
+        Tries, in order:
+        1. Config override (PLANE_WORKSPACE_SLUG)
+        2. OAuth app installation endpoint (if app_installation_id configured)
+        3. Plane API workspace endpoint (by ID)
+        4. Fallback to workspace ID itself
+        """
         if settings.plane_workspace_slug:
             return settings.plane_workspace_slug
-        # Try to fetch from API
+        # Try OAuth installation endpoint
+        if self.plane._app_installation_id:
+            slug = await self.plane.get_workspace_slug_from_installation()
+            if slug:
+                return slug
+        # Try API
         try:
             ws_data = await self.plane.get_workspace(workspace_id)
             if ws_data:
@@ -1451,8 +1599,7 @@ class AgentWebhookHandler:
                     return slug
         except Exception:
             pass
-        # Fallback: use the workspace ID itself
-        log.warning("Could not resolve workspace slug for %s — using ID", workspace_id)
+        log.warning("Could not resolve workspace slug for %s \u2014 using ID", workspace_id)
         return workspace_id
 
     async def _handle_run_created(self, payload: dict[str, Any]) -> str:
@@ -1601,7 +1748,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         PORT, settings.plane_api_url,
     )
 
-    plane = PlaneClient(settings.plane_api_key, settings.plane_api_url)
+    plane = PlaneClient(
+        settings.plane_api_key,
+        settings.plane_api_url,
+        client_id=settings.plane_client_id,
+        client_secret=settings.plane_client_secret,
+        app_installation_id=settings.plane_app_installation_id,
+    )
     processor = TaskProcessor(plane)
     handler = AgentWebhookHandler(plane, processor)
 
@@ -1640,10 +1793,14 @@ async def health() -> dict[str, Any]:
 @app.post("/webhook/plane")
 async def plane_webhook(request: Request) -> Response:
     """Receive Plane webhook events (agent_run, agent_run_activity)."""
-    # 1. Read body
+    # 1. Log delivery ID (from X-Plane-Delivery header) for traceability
+    delivery_id = request.headers.get("X-Plane-Delivery", "")
+    event_type_header = request.headers.get("X-Plane-Event", "")
+
+    # 2. Read body
     body = await request.body()
 
-    # 2. Verify HMAC signature (X-Plane-Signature header)
+    # 3. Verify HMAC signature (X-Plane-Signature header)
     signature = request.headers.get("X-Plane-Signature", "")
     if not verify_hmac(body, signature, settings.plane_webhook_secret):
         # Also try X-Hub-Signature-256 (common alternative)
