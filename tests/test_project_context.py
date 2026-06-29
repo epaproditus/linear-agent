@@ -1,4 +1,4 @@
-"""PLY-78: Verify how much Linear project context reaches the LLM prompt."""
+"""PLY-78: Verify Linear project and guidance context in LLM prompts."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ import pytest
 
 from linear_agent import (
     AgentSession,
+    PROJECT_CONTEXT_MAX_LEN,
     SessionAction,
     TaskProcessor,
+    format_guidance_block,
+    format_project_context_block,
     parse_prompt_context,
 )
 
@@ -51,22 +54,66 @@ def sample_session() -> AgentSession:
         title="Determine how much project context is injected",
         description="Investigate what project data is provided.",
         guidance=parsed["guidance"],
+        project_name=parsed.get("project_name", ""),
+        project_summary=parsed.get("project_summary", ""),
     )
 
 
-def test_parse_prompt_context_does_not_extract_project() -> None:
+def test_parse_prompt_context_extracts_project() -> None:
     parsed = parse_prompt_context(LINEAR_PROMPT_CONTEXT_EXAMPLE)
 
-    assert "project" not in parsed
-    assert parsed["identifier"] == "PLY-78"
-    assert parsed["title"] == "Determine how much project context is injected"
+    assert parsed["project_name"] == "Hermes as Linear agent"
+    assert parsed["project_summary"] == "@-mention @Hermes on any issue — fast agent."
     assert parsed["guidance"] == ["Always follow coding standards"]
 
-    # Project summary text inside <project> must not appear in any parsed field.
-    assert "Hermes on any issue" not in str(parsed.values())
+
+def test_format_project_context_block_from_graphql() -> None:
+    block = format_project_context_block({
+        "name": "Hermes as Linear agent",
+        "description": "Fast autonomous agent for Linear issues",
+        "content": "## Architecture\n\nLinear webhook -> Hermes API",
+        "url": "https://linear.app/team/project/hermes",
+        "status": {"name": "In Progress", "type": "started"},
+    })
+
+    assert "Project: Hermes as Linear agent" in block
+    assert "Project status: In Progress (started)" in block
+    assert "Project URL: https://linear.app/team/project/hermes" in block
+    assert "Project summary: Fast autonomous agent" in block
+    assert "Linear webhook -> Hermes API" in block
 
 
-def test_build_llm_prompt_includes_project_name_only(
+def test_format_project_context_block_uses_prompt_context_fallback() -> None:
+    block = format_project_context_block(
+        None,
+        fallback_name="Hermes as Linear agent",
+        fallback_summary="@-mention @Hermes on any issue — fast agent.",
+    )
+
+    assert "Project: Hermes as Linear agent" in block
+    assert "Project summary: @-mention @Hermes" in block
+
+
+def test_format_project_context_block_truncates_long_content() -> None:
+    long_content = "x" * (PROJECT_CONTEXT_MAX_LEN + 500)
+    block = format_project_context_block({
+        "name": "Big project",
+        "content": long_content,
+    })
+
+    assert "…(truncated)" in block
+    assert len(block) < len(long_content)
+
+
+def test_format_guidance_block() -> None:
+    block = format_guidance_block(["Always follow coding standards", "Use PRs"])
+    assert "Team/workspace guidance:" in block
+    assert "- Always follow coding standards" in block
+    assert "- Use PRs" in block
+    assert format_guidance_block([]) == ""
+
+
+def test_build_llm_prompt_includes_rich_project_and_guidance(
     processor: TaskProcessor, sample_session: AgentSession
 ) -> None:
     issue = {
@@ -79,8 +126,10 @@ def test_build_llm_prompt_includes_project_name_only(
         "project": {
             "id": "proj-1",
             "name": "Hermes as Linear agent",
-            "description": "## Architecture\n\nLinear webhook -> Hermes API",
-            "summary": "Fast autonomous agent for Linear issues",
+            "description": "Fast autonomous agent for Linear issues",
+            "content": "## Architecture\n\nLinear webhook -> Hermes API",
+            "url": "https://linear.app/team/project/hermes",
+            "status": {"name": "In Progress", "type": "started"},
         },
     }
 
@@ -92,35 +141,9 @@ def test_build_llm_prompt_includes_project_name_only(
     )
 
     assert "Project: Hermes as Linear agent" in prompt
-    assert "Linear webhook" not in prompt
-    assert "Fast autonomous agent" not in prompt
-    assert "Architecture" not in prompt
-
-
-def test_build_llm_prompt_omits_stored_guidance(
-    processor: TaskProcessor, sample_session: AgentSession
-) -> None:
-    assert sample_session.guidance == ["Always follow coding standards"]
-
-    issue = {
-        "identifier": "PLY-78",
-        "title": "Test",
-        "description": "Desc",
-        "state": {"name": "Todo"},
-        "team": {"name": "Eng", "key": "E"},
-        "labels": {"nodes": []},
-        "project": {"name": "Hermes as Linear agent"},
-    }
-
-    prompt = processor.build_llm_prompt(
-        sample_session,
-        issue,
-        conversation_text="",
-        user_request="Go",
-    )
-
-    assert "Always follow coding standards" not in prompt
-    assert "guidance" not in prompt.lower()
+    assert "Linear webhook -> Hermes API" in prompt
+    assert "Always follow coding standards" in prompt
+    assert "Team/workspace guidance:" in prompt
 
 
 def test_build_llm_prompt_omits_raw_prompt_context_xml(
@@ -151,7 +174,8 @@ def test_gql_issue_by_id_project_fields() -> None:
     """Document which project fields the issue fetch query requests."""
     from linear_agent import GQL_ISSUE_BY_ID
 
-    match = re.search(r"project\s*\{([^}]+)\}", GQL_ISSUE_BY_ID)
+    match = re.search(r"project\s*\{([^}]+)\}", GQL_ISSUE_BY_ID, re.DOTALL)
     assert match is not None
-    fields = match.group(1).split()
-    assert fields == ["id", "name"]
+    fields = match.group(1)
+    for field in ("id", "name", "description", "content", "url", "status"):
+        assert field in fields

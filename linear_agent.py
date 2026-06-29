@@ -103,6 +103,7 @@ _PLAN_DONE = "completed"
 PLAN_STEP_MAX_LEN = 48
 PLAN_MAX_STEPS = 5
 PLAN_STEP_MAX_WORDS = 6
+PROJECT_CONTEXT_MAX_LEN = 4000
 
 # Map embedded shell/git commands to short checklist labels.
 _PLAN_COMMAND_LABELS: list[tuple[re.Pattern[str], str]] = [
@@ -232,7 +233,14 @@ query Issue($id: String!) {
     url
     state { id name type }
     team { id key name }
-    project { id name }
+    project {
+      id
+      name
+      description
+      content
+      url
+      status { name type }
+    }
     assignee { id name email }
     delegate { id name email }
     labels { nodes { id name } }
@@ -423,6 +431,8 @@ class AgentSession:
     state_type: str = ""
     comments: list[dict] = field(default_factory=list)
     guidance: list[str] = field(default_factory=list)
+    project_name: str = ""
+    project_summary: str = ""
     previous_activities: list[dict] = field(default_factory=list)
 
 
@@ -1043,7 +1053,79 @@ def parse_prompt_context(xml_str: str) -> dict[str, Any]:
     # Count comments
     result["comment_count"] = len(re.findall(r"<comment[^>]*>", xml_str))
 
+    # Project name + summary (inner text of <project> tag in promptContext)
+    m = re.search(
+        r'<project name="([^"]*)"[^>]*>([^<]*)</project>', xml_str,
+    )
+    if m:
+        result["project_name"] = m.group(1).strip()
+        result["project_summary"] = m.group(2).strip()
+    else:
+        m = re.search(r'<project name="([^"]*)"', xml_str)
+        if m:
+            result["project_name"] = m.group(1).strip()
+
     return result
+
+
+def _truncate_context(text: str, limit: int = PROJECT_CONTEXT_MAX_LEN) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…(truncated)"
+
+
+def format_project_context_block(
+    issue_project: dict[str, Any] | None,
+    *,
+    fallback_name: str = "",
+    fallback_summary: str = "",
+) -> str:
+    """Format Linear project fields for LLM prompt injection."""
+    project = issue_project or {}
+    name = (project.get("name") or fallback_name or "").strip()
+    summary = (project.get("description") or fallback_summary or "").strip()
+    content = (project.get("content") or "").strip()
+
+    if not name and not summary and not content:
+        return "Project: (none)\n"
+
+    lines = [f"Project: {name or '(unnamed)'}"]
+
+    status = project.get("status") or {}
+    status_name = (status.get("name") or "").strip()
+    status_type = (status.get("type") or "").strip()
+    if status_name or status_type:
+        if status_name and status_type:
+            lines.append(f"Project status: {status_name} ({status_type})")
+        else:
+            lines.append(f"Project status: {status_name or status_type}")
+
+    url = (project.get("url") or "").strip()
+    if url:
+        lines.append(f"Project URL: {url}")
+
+    if summary:
+        lines.append(f"Project summary: {summary}")
+
+    if content:
+        lines.append(f"Project overview:\n{_truncate_context(content)}")
+
+    return "\n".join(lines) + "\n"
+
+
+def format_guidance_block(guidance: list[str]) -> str:
+    """Format workspace/team guidance rules for LLM prompt injection."""
+    rules = [g.strip() for g in guidance if g and g.strip()]
+    if not rules:
+        return ""
+    return (
+        "Team/workspace guidance:\n"
+        + "\n".join(f"- {rule}" for rule in rules)
+        + "\n"
+    )
 
 
 def _format_activities_conversation(activities: list[dict[str, Any]]) -> str:
@@ -2042,7 +2124,8 @@ class TaskProcessor:
         The prompt consists of:
         1. System declaration ("You are Hermes...")
         2. LINEAR_API_KEY usage (referenced as env var, never interpolated directly)
-        3. Issue context: identifier, title, status, project, team, labels, description
+        3. Issue context: identifier, title, status, project (name, status, url,
+           summary, overview), team, labels, description, workspace guidance
         4. Conversation thread (all comments, chronological, full body — deterministic)
         5. Prior session activity (tool calls, thoughts — prompted sessions only)
         6. User's message (session.body or description fallback)
@@ -2057,7 +2140,12 @@ class TaskProcessor:
         labels = [l["name"] for l in
                   (issue.get("labels", {}).get("nodes", []) or [])]
         project = issue.get("project") or {}
-        project_name = project.get("name", "")
+        project_block = format_project_context_block(
+            project,
+            fallback_name=session.project_name,
+            fallback_summary=session.project_summary,
+        )
+        guidance_block = format_guidance_block(session.guidance)
         team = issue.get("team") or {}
         team_name = team.get("name", "")
         team_key = team.get("key", "")
@@ -2091,10 +2179,11 @@ class TaskProcessor:
                 f" tools if you need it.\n"
                 f"\n"
                 f"Issue: {identifier} — {title}\n"
-                f"Project: {project_name or '(none)'}\n"
+                f"{project_block}"
                 f"Team: {team_name}"
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
+                f"{guidance_block}"
                 f"{skills_block}"
                 f"{plan_block}"
                 f"{internal_text}\n"
@@ -2126,11 +2215,12 @@ class TaskProcessor:
                 f"\n"
                 f"Issue: {identifier} — {title}"
                 f" | Status: {state.get('name', 'Unknown')}\n"
-                f"Project: {project_name or '(none)'}\n"
+                f"{project_block}"
                 f"Team: {team_name}"
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
                 f"Description: {description or '(no description)'}\n"
+                f"{guidance_block}"
                 f"{skills_block}"
                 f"{plan_block}"
                 f"{internal_text}\n"
@@ -3147,6 +3237,8 @@ class AgentWebhookHandler:
             state_type=issue_data.get("state", {}).get("type", ""),
             comments=previous_comments,
             guidance=parsed_context.get("guidance", []),
+            project_name=parsed_context.get("project_name", ""),
+            project_summary=parsed_context.get("project_summary", ""),
         )
 
         # ── Team allowlist check ──

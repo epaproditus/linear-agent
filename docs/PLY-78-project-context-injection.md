@@ -6,9 +6,7 @@
 
 ## Executive summary
 
-**The agent receives only a subset of project data — the project name — not the full project content.**
-
-Linear's webhook `promptContext` XML can include a project name and summary, but Hermes does not parse or forward that XML block. Instead, the agent re-fetches the issue via GraphQL and injects `project.name` only. Project description, summary, state, links, milestones, and documents are **not** included in the LLM prompt unless the agent discovers them at runtime via tools (e.g. `list_projects()` or shell/GraphQL calls using `$LINEAR_API_KEY`).
+**The agent receives rich project context in LLM prompts:** name, status, URL, summary (`description`), and overview (`content`, truncated to 4k chars). Workspace/team **guidance** rules from `promptContext` are also injected. When GraphQL returns no project, `promptContext` `<project>` name and summary are used as fallback.
 
 ---
 
@@ -18,24 +16,17 @@ Linear's webhook `promptContext` XML can include a project name and summary, but
 flowchart TD
     WH[Linear AgentSessionEvent webhook] --> PC[promptContext XML]
     WH --> AS[agentSession.issue structured fields]
-    WH --> PC2[previousComments + guidance]
 
     PC --> PARSE[parse_prompt_context]
-    PARSE --> SESS[AgentSession dataclass]
-    PARSE -.->|project XML not parsed| DROP1[discarded]
-
-    AS --> SESS
-    PC2 --> SESS
-  SESS -->|guidance stored| SESS
-    SESS -.->|guidance never read| DROP2[not in LLM prompt]
+    PARSE --> SESS[AgentSession: project_name, project_summary, guidance]
 
     SESS --> RUN[_run_session]
     RUN --> GQL[GQL_ISSUE_BY_ID GraphQL fetch]
-    GQL --> ISSUE[issue dict with project id + name only]
+    GQL --> ISSUE[issue.project: id, name, description, content, url, status]
     ISSUE --> BUILD[build_llm_prompt]
+    PARSE --> BUILD
+    SESS --> BUILD
     BUILD --> LLM[Hermes /chat/completions]
-
-    GQL -.->|description, summary, state, links omitted| DROP3[not fetched]
 ```
 
 ---
@@ -44,15 +35,15 @@ flowchart TD
 
 ### 1. `promptContext` (top-level webhook string)
 
-Linear documents this as formatted XML with issue details, comments, guidance, and project info. Example from [Developing the Agent Interaction](https://linear.app/developers/agent-interaction):
+Linear documents this as formatted XML with issue details, comments, guidance, and project info:
 
 ```xml
 <project name="Checkout flow">Faster checkout process</project>
 ```
 
-The `name` attribute is the project title; the **text content** inside the tag is the project **summary**.
+Hermes parses project name and summary from this XML and stores them on `AgentSession` as fallback when GraphQL project data is missing. The raw XML is **not** forwarded to the LLM.
 
-Hermes stores the raw string on `AgentSession.prompt_context` but **never passes it to the LLM**. `parse_prompt_context()` extracts:
+`parse_prompt_context()` extracts:
 
 | Field | Extracted? |
 |-------|------------|
@@ -62,12 +53,12 @@ Hermes stores the raw string on `AgentSession.prompt_context` but **never passes
 | `team_name` | Yes |
 | `labels` | Yes |
 | `guidance` | Yes (rule text only) |
+| `project_name` | Yes |
+| `project_summary` | Yes (inner text of `<project>`) |
 | `primary_directive` | Yes |
 | `comment_count` | Yes |
-| **`<project>` name** | **No** |
-| **`<project>` summary (inner text)** | **No** |
 | `parent-issue` | No |
-| Comment thread bodies | No (handled separately) |
+| Comment thread bodies | No (handled separately via GraphQL) |
 
 ### 2. Structured webhook fields
 
@@ -79,9 +70,7 @@ From `_handle_agent_session()`:
 | `agentSession.comment` | User @mention body (created events) |
 | `agentActivity.body` | Follow-up user message (prompted events) |
 | `previousComments` | Stored on session; **comments are re-fetched** via GraphQL in `_handle_analysis` |
-| `guidance` (top-level) | Parsed from XML into `session.guidance` — **stored but not injected into prompts** |
-
-The webhook `agentSession.issue` object does **not** include nested project description in our handler; project data comes from the later GraphQL fetch.
+| `guidance` (in promptContext XML) | Parsed into `session.guidance` → **injected into LLM prompt** |
 
 ---
 
@@ -90,41 +79,57 @@ The webhook `agentSession.issue` object does **not** include nested project desc
 ### Issue query (`GQL_ISSUE_BY_ID`)
 
 ```graphql
-project { id name }
+project {
+  id
+  name
+  description
+  content
+  url
+  status { name type }
+}
 ```
 
-Only **project id and name** are requested. No `description`, `summary`, `state`, `content`, `url`, `lead`, `members`, or `documents`.
+- `description` — short project summary
+- `content` — full markdown project overview
+- `status` — lifecycle state (e.g. `started`, `completed`)
 
 ### Projects query (`GQL_PROJECTS`) — on-demand only
 
-Used by `LinearClient.list_projects()` / `find_project_by_name()` when the **agent explicitly calls** those APIs during tool use:
-
-```graphql
-id, name, description, url, teams { ... }
-```
-
-This is **not** called automatically when handling an issue.
+Still used by `LinearClient.list_projects()` when the agent explicitly calls it during tool use — not part of automatic session injection.
 
 ---
 
 ## What reaches the LLM prompt
 
-`TaskProcessor.build_llm_prompt()` assembles the Hermes user message. Project-related content:
+`TaskProcessor.build_llm_prompt()` injects a **project context block**:
 
-| Session type | Project in prompt |
-|--------------|-------------------|
-| `created` (first @mention / delegation) | `Project: {name}` or `Project: (none)` |
-| `prompted` (follow-up) | Same single line |
+```
+Project: Hermes as Linear agent
+Project status: In Progress (started)
+Project URL: https://linear.app/...
+Project summary: @-mention @Hermes on any issue...
+Project overview:
+## Architecture
+...
+```
 
-**Not included anywhere in the prompt:**
+Plus, when present:
 
-- Project description / summary / state
-- Project links or documents
-- Raw `promptContext` XML
-- Parsed `session.guidance` rules
-- `session.prompt_context`
+```
+Team/workspace guidance:
+- Always follow coding standards
+```
 
-### Other context that *is* injected (for completeness)
+| Session type | Project + guidance in prompt |
+|--------------|------------------------------|
+| `created` (first @mention / delegation) | Full project block + guidance + issue description |
+| `prompted` (follow-up) | Full project block + guidance (no issue description repeat) |
+
+**Truncation:** `content` is capped at `PROJECT_CONTEXT_MAX_LEN` (4000 chars) with `…(truncated)` suffix.
+
+**Not included:** Raw `promptContext` XML, project documents/milestones/members (unless agent fetches via tools).
+
+### Other context that *is* injected
 
 | Block | Source | Notes |
 |-------|--------|-------|
@@ -133,41 +138,12 @@ This is **not** called automatically when handling an issue.
 | Prior session activity | GraphQL session activities | `prompted` sessions only |
 | Hermes skills list | `GET /v1/skills` | Name + truncated description |
 | Session plan steps | LLM plan call | 3–5 checklist labels |
-| Work/reply style | Constants | `HERMES_WORK_STYLE`, `HERMES_REPLY_STYLE` |
-
-The plan-generation call (`_build_plan_prompt`) also omits project context — only issue identifier, title, truncated description (800 chars), skills, and user request.
 
 ---
 
 ## Concrete example (PLY-78 issue)
 
-The issue is attached to project **"Hermes as Linear agent"**, which in Linear has a long markdown description (architecture, deploy commands, repo link, status checklist). What Hermes sees in the LLM prompt:
-
-```
-Project: Hermes as Linear agent
-```
-
-Nothing from the project description block (Architecture, Key capabilities, Deploy, Repo, etc.) is injected automatically.
-
----
-
-## Gaps and implications
-
-1. **Project summary in `promptContext` is lost** — Linear embeds it in `<project name="…">summary text</project>` but we neither parse it nor forward the raw XML.
-2. **GraphQL under-fetches project** — Even the authoritative API path only retrieves `id` and `name`.
-3. **Guidance rules are parsed but unused** — Workspace/team-level instructions from `promptContext` are stored on `AgentSession.guidance` and never appended to `build_llm_prompt()`.
-4. **Agent can still learn project details at runtime** — Via `$LINEAR_API_KEY`, Hermes can call Linear GraphQL or use `list_projects()` if it chooses to investigate; that is opportunistic, not guaranteed context.
-
----
-
-## Recommendations (out of scope for this investigation)
-
-If full project context is desired:
-
-1. Extend `GQL_ISSUE_BY_ID` to `project { id name description summary state { name } url }` (fields available per Linear schema).
-2. Parse `<project>` from `promptContext` as a fallback when GraphQL project is null.
-3. Append `session.guidance` to the prompt as a "Team/workspace guidance" block.
-4. Optionally inject a truncated project description (e.g. first 2–4k chars) in `build_llm_prompt()`.
+For project **"Hermes as Linear agent"**, Hermes now receives the project name, status, URL, summary, and the full markdown overview (architecture, deploy commands, repo link, etc.) up to 4k characters — plus any team guidance rules from `promptContext`.
 
 ---
 
@@ -176,14 +152,8 @@ If full project context is desired:
 Automated checks: `tests/test_project_context.py`
 
 ```bash
-python -m pytest tests/test_project_context.py -v
+LINEAR_API_KEY=test LINEAR_WEBHOOK_SECRET=test python3 -m pytest tests/test_project_context.py -v
 ```
-
-Key assertions:
-
-- `parse_prompt_context` ignores `<project>` tags
-- `build_llm_prompt` contains project name only, not description/summary
-- `session.guidance` is not reflected in the assembled prompt
 
 ## Code references
 
@@ -191,6 +161,6 @@ Key assertions:
 |---------|----------|
 | Issue GraphQL project fields | `linear_agent.py` — `GQL_ISSUE_BY_ID` |
 | promptContext parser | `linear_agent.py` — `parse_prompt_context()` |
+| Project/guidance formatters | `linear_agent.py` — `format_project_context_block()`, `format_guidance_block()` |
 | LLM prompt assembly | `linear_agent.py` — `build_llm_prompt()` |
 | Webhook → session | `linear_agent.py` — `_handle_agent_session()` |
-| On-demand project list | `linear_agent.py` — `GQL_PROJECTS`, `list_projects()` |
