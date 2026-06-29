@@ -249,17 +249,29 @@ Plane Webhook ──POST──► FastAPI (port 8648)
 ### Setup
 
 1. Create an OAuth app in Plane with **Enable App Mentions** and **Agent Run** scopes
-2. Complete the Bot Token Flow to get your bot token
-3. Configure the agent via `.env`:
+2. Register these URLs in the OAuth app (must be publicly reachable):
+   - **Setup URL:** `https://<public-host>/plane/install`
+   - **Redirect URI:** `https://<public-host>/plane/oauth/callback`
+   - **Webhook URL:** `https://<public-host>/plane/webhook`
+3. Configure the agent via `.env` (bot token not required yet):
    ```
-   PLANE_API_KEY=<bot_token>
    PLANE_WEBHOOK_SECRET=<webhook_secret>
-   PLANE_WORKSPACE_SLUG=epaphroditus
+   PLANE_CLIENT_ID=<client_id>
+   PLANE_CLIENT_SECRET=<client_secret>
+   PLANE_PUBLIC_URL=https://<public-host>
    ```
 4. Start the agent:
    ```bash
    uvicorn plane_agent:app --host 0.0.0.0 --port 8648
    ```
+5. In Plane, click **Install** on your OAuth app. The Setup URL redirects to Plane's consent screen; after approval, the callback exchanges the installation ID for a bot token and writes `PLANE_API_KEY` to `.env`.
+
+After installation, these values are populated automatically:
+```
+PLANE_API_KEY=<bot_token>
+PLANE_APP_INSTALLATION_ID=<installation_id>
+PLANE_WORKSPACE_SLUG=<workspace_slug>
+```
 
 ### Webhooks
 
