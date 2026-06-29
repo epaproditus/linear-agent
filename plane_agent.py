@@ -23,26 +23,21 @@ Port: 8648
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import hmac
 import json
 import logging
 import os
 import re
-import textwrap
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 # ── Logging ──────────────────────────────────────────────────────────────
@@ -280,10 +275,15 @@ class PlaneClient:
 
         if activity_type == ActivityType.action:
             content["action"] = action_label or ""
-            content["parameter"] = action_param or ""
             content["body"] = body
+            # Plane expects `parameters` as a key-value object (not a string)
+            params: dict[str, str] = {}
+            if action_param:
+                params["query"] = action_param
             if action_result:
-                content["result"] = action_result
+                params["result"] = action_result
+            if params:
+                content["parameters"] = params
         else:
             content["body"] = body
 
@@ -452,14 +452,6 @@ def verify_hmac(payload: bytes, signature: str, secret: str) -> bool:
             expected[:16], str(signature)[:16], len(payload), len(secret),
         )
     return result
-
-
-def _is_plane_system_comment(body: str) -> bool:
-    """Detect Plane's auto-generated run-comment (not real user input)."""
-    if not body:
-        return False
-    normalized = body.strip().lower()
-    return normalized.startswith("this thread is for an agent session")
 
 
 # ── Progress helpers ─────────────────────────────────────────────────────
@@ -1464,13 +1456,27 @@ class AgentWebhookHandler:
         return workspace_id
 
     async def _handle_run_created(self, payload: dict[str, Any]) -> str:
-        """Handle agent_run created webhook."""
+        """Handle agent_run created webhook.
+
+        Plane webhook payload (from docs):
+        {
+            "action": "created",
+            "agent_run": {
+                "id": "uuid", "agent_user": "uuid", "issue": "uuid",
+                "project": "uuid", "workspace": "uuid",
+                "status": "created", "type": "comment_thread",
+            },
+            "agent_user_id": "uuid", "app_client_id": "id",
+            "issue_id": "uuid", "project_id": "uuid",
+            "workspace_id": "uuid", "comment_id": "uuid",
+            "type": "agent_run"
+        }
+        """
         agent_run = payload.get("agent_run", {})
         run_id = agent_run.get("id", "")
-        work_item_id = payload.get("issue_id", payload.get("issue", ""))
+        work_item_id = payload.get("issue_id", agent_run.get("issue", ""))
         workspace_id = payload.get("workspace_id", agent_run.get("workspace", ""))
         project_id = payload.get("project_id", agent_run.get("project", ""))
-        comment_body = payload.get("comment", {}).get("body", "") if isinstance(payload.get("comment"), dict) else ""
 
         if not run_id:
             return "ignored (no run id)"
@@ -1488,19 +1494,14 @@ class AgentWebhookHandler:
 
         workspace_slug = await self._resolve_workspace_slug(workspace_id, payload)
 
-        # For created events, ignore the auto-generated session comment
-        if _is_plane_system_comment(comment_body):
-            comment_body = ""
-
         run = AgentRun(
             run_id=run_id,
             work_item_id=work_item_id,
-            work_item_identifier=work_item_id,
+            work_item_identifier=work_item_id,  # Will be resolved when we fetch the issue
             workspace_id=workspace_id,
             workspace_slug=workspace_slug,
             project_id=project_id,
             action=RunAction.created,
-            body=comment_body,
             title=agent_run.get("name", ""),
         )
 
