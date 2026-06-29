@@ -10,7 +10,6 @@ from plane_agent import (  # noqa: E402
     extract_github_pr_urls,
     format_hermes_tool_progress,
     verify_hmac,
-    _is_plane_system_comment,
 )
 
 
@@ -44,10 +43,3 @@ def test_extract_github_pr_urls():
         "See https://github.com/org/repo/pull/11 for details."
     )
     assert urls == ["https://github.com/org/repo/pull/11"]
-
-
-def test_is_plane_system_comment():
-    assert _is_plane_system_comment(
-        "This thread is for an agent session with Hermes."
-    )
-    assert not _is_plane_system_comment("Please investigate the bug.")

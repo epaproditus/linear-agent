@@ -113,7 +113,7 @@ RATE_LIMIT_MAX_REQUESTS = 30
 class Settings(BaseSettings):
     """Environment-based configuration."""
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     plane_api_key: str = ""
     """Plane bot token (from Bot Token Flow — 24h expiry, auto-refreshable)."""
