@@ -23,12 +23,15 @@ Port: 8648
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
 import logging
 import os
 import re
 import time
+from pathlib import Path
+from urllib.parse import urlencode, quote
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -37,7 +40,8 @@ from enum import Enum
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic_settings import BaseSettings
 
 # ── Logging ──────────────────────────────────────────────────────────────
@@ -143,6 +147,12 @@ class Settings(BaseSettings):
     plane_app_installation_id: str = ""
     """Plane app installation UUID for bot token refresh."""
 
+    plane_public_url: str = ""
+    """Public base URL for OAuth install (e.g. https://plane.epaphroditus.us)."""
+
+    plane_redirect_uri: str = ""
+    """OAuth redirect URI registered in Plane. Defaults to {PLANE_PUBLIC_URL}/oauth/callback."""
+
     hermes_api_url: str = "http://127.0.0.1:8642/v1"
     """Hermes API server URL for LLM reasoning."""
 
@@ -153,16 +163,39 @@ class Settings(BaseSettings):
     """Model name to use via Hermes API."""
 
     @property
+    def effective_redirect_uri(self) -> str:
+        if self.plane_redirect_uri:
+            return self.plane_redirect_uri
+        if self.plane_public_url:
+            return f"{self.plane_public_url.rstrip('/')}/oauth/callback"
+        return ""
+
+    @property
+    def oauth_install_ready(self) -> bool:
+        return bool(
+            self.plane_client_id
+            and self.plane_client_secret
+            and self.effective_redirect_uri
+        )
+
+    @property
     def configured(self) -> bool:
-        return bool(self.plane_api_key) and bool(self.plane_webhook_secret)
+        return bool(self.plane_webhook_secret) and (
+            bool(self.plane_api_key) or self.oauth_install_ready
+        )
 
 
 settings = Settings()
 
-# Safety: don't run without config
-assert settings.configured, (
-    "PLANE_API_KEY and PLANE_WEBHOOK_SECRET must be set. "
+# Safety: don't run without minimal config
+assert settings.plane_webhook_secret, (
+    "PLANE_WEBHOOK_SECRET must be set. "
     "Copy .env.example to .env and fill in your credentials."
+)
+assert settings.plane_api_key or settings.oauth_install_ready, (
+    "Set PLANE_API_KEY after installation, or configure OAuth install credentials "
+    "(PLANE_CLIENT_ID, PLANE_CLIENT_SECRET, and PLANE_PUBLIC_URL or PLANE_REDIRECT_URI) "
+    "before installing the app from Plane."
 )
 
 
@@ -348,6 +381,20 @@ class PlaneClient:
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+
+    def update_credentials(
+        self,
+        *,
+        api_key: str | None = None,
+        app_installation_id: str | None = None,
+    ) -> None:
+        """Update runtime credentials after OAuth installation."""
+        if api_key:
+            self._api_key = api_key
+        if app_installation_id:
+            self._app_installation_id = app_installation_id
+        if self._client and not self._client.is_closed:
+            self._client.headers["Authorization"] = f"Bearer {self._api_key}"
 
     # ── Agent Run Activities ──
 
@@ -589,6 +636,112 @@ def verify_hmac(payload: bytes, signature: str, secret: str) -> bool:
             expected[:16], str(signature)[:16], len(payload), len(secret),
         )
     return result
+
+
+# ── OAuth install flow ───────────────────────────────────────────────────
+
+
+def build_plane_consent_url(
+    *,
+    client_id: str,
+    redirect_uri: str,
+    api_url: str = PLANE_API_URL_DEFAULT,
+) -> str:
+    """Build Plane's OAuth consent URL for app installation."""
+    params = urlencode({
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+    })
+    return f"{api_url.rstrip('/')}/auth/o/authorize-app/?{params}"
+
+
+async def exchange_bot_token(
+    *,
+    client_id: str,
+    client_secret: str,
+    app_installation_id: str,
+    api_url: str = PLANE_API_URL_DEFAULT,
+) -> dict[str, Any]:
+    """Exchange an app installation ID for a bot token (client credentials flow)."""
+    credentials = f"{client_id}:{client_secret}"
+    encoded = base64.b64encode(credentials.encode()).decode()
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"{api_url.rstrip('/')}/auth/o/token/",
+            headers={
+                "Authorization": f"Basic {encoded}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "client_credentials",
+                "app_installation_id": app_installation_id,
+                "scope": "read write",
+            },
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Bot token exchange failed ({resp.status_code}): {resp.text[:300]}"
+            )
+        data = resp.json()
+        access_token = data.get("access_token")
+        if not access_token:
+            raise RuntimeError("Bot token exchange returned no access_token")
+        return data
+
+
+async def fetch_app_installation(
+    *,
+    bot_token: str,
+    app_installation_id: str,
+    api_url: str = PLANE_API_URL_DEFAULT,
+) -> dict[str, Any] | None:
+    """Fetch app installation details (workspace slug, bot user ID)."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{api_url.rstrip('/')}/auth/o/app-installation/",
+            params={"id": app_installation_id},
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        if resp.status_code != 200:
+            log.warning("App installation query returned %d", resp.status_code)
+            return None
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0]
+        return None
+
+
+def update_env_file(
+    env_path: Path,
+    updates: dict[str, str],
+) -> None:
+    """Upsert key=value pairs in a .env file."""
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    for key, value in updates.items():
+        replacement = f"{key}={value}"
+        replaced = False
+        for idx, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[idx] = replacement
+                replaced = True
+                break
+        if not replaced:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(replacement)
+        seen.add(key)
+
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ── Progress helpers ─────────────────────────────────────────────────────
@@ -1786,6 +1939,8 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "agent": "plane-agent",
         "api_url": settings.plane_api_url,
+        "installed": bool(settings.plane_api_key),
+        "oauth_install_ready": settings.oauth_install_ready,
     }
 
 
@@ -1842,6 +1997,196 @@ async def plane_webhook(request: Request) -> Response:
         content=json.dumps({"status": status}),
         media_type="application/json",
         status_code=200,
+    )
+
+
+# ── OAuth install flow routes ────────────────────────────────────────────
+
+
+@app.get("/plane/install")
+async def plane_install() -> RedirectResponse:
+    """OAuth Setup URL — redirect users to Plane's consent screen."""
+    if not settings.oauth_install_ready:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "OAuth install is not configured. Set PLANE_CLIENT_ID, "
+                "PLANE_CLIENT_SECRET, and PLANE_PUBLIC_URL (or PLANE_REDIRECT_URI)."
+            ),
+        )
+
+    consent_url = build_plane_consent_url(
+        client_id=settings.plane_client_id,
+        redirect_uri=settings.effective_redirect_uri,
+        api_url=settings.plane_api_url,
+    )
+    log.info("Redirecting to Plane OAuth consent screen")
+    return RedirectResponse(url=consent_url, status_code=302)
+
+
+@app.get("/plane/oauth/callback")
+async def plane_oauth_callback(
+    request: Request,
+    app_installation_id: str | None = Query(default=None),
+    code: str | None = Query(default=None),
+) -> HTMLResponse:
+    """OAuth Redirect URI — exchange installation ID for a bot token."""
+    if not app_installation_id:
+        raise HTTPException(status_code=400, detail="Missing app_installation_id")
+    if not settings.plane_client_id or not settings.plane_client_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="PLANE_CLIENT_ID and PLANE_CLIENT_SECRET must be configured.",
+        )
+
+    try:
+        token_data = await exchange_bot_token(
+            client_id=settings.plane_client_id,
+            client_secret=settings.plane_client_secret,
+            app_installation_id=app_installation_id,
+            api_url=settings.plane_api_url,
+        )
+    except RuntimeError as e:
+        log.exception("OAuth callback failed during token exchange")
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    bot_token = str(token_data["access_token"])
+    installation = await fetch_app_installation(
+        bot_token=bot_token,
+        app_installation_id=app_installation_id,
+        api_url=settings.plane_api_url,
+    )
+
+    workspace_slug = ""
+    bot_user_id = ""
+    if installation:
+        ws_detail = installation.get("workspace_detail", {})
+        workspace_slug = str(ws_detail.get("slug", "") or "")
+        bot_user_id = str(installation.get("app_bot", "") or "")
+
+    settings.plane_api_key = bot_token
+    settings.plane_app_installation_id = app_installation_id
+    if workspace_slug:
+        settings.plane_workspace_slug = workspace_slug
+    if bot_user_id:
+        settings.plane_agent_user_id = bot_user_id
+
+    plane: PlaneClient = request.app.state.plane
+    plane.update_credentials(
+        api_key=bot_token,
+        app_installation_id=app_installation_id,
+    )
+
+    env_updates = {
+        "PLANE_API_KEY": bot_token,
+        "PLANE_APP_INSTALLATION_ID": app_installation_id,
+    }
+    if workspace_slug:
+        env_updates["PLANE_WORKSPACE_SLUG"] = workspace_slug
+    if bot_user_id:
+        env_updates["PLANE_AGENT_USER_ID"] = bot_user_id
+
+    env_path = Path(os.getenv("PLANE_ENV_FILE", ".env"))
+    try:
+        update_env_file(env_path, env_updates)
+        env_saved = True
+    except OSError as e:
+        log.warning("Could not persist OAuth credentials to %s: %s", env_path, e)
+        env_saved = False
+
+    log.info(
+        "Plane app installed (installation=%s workspace=%s code_present=%s)",
+        app_installation_id[:8],
+        workspace_slug or "(unknown)",
+        bool(code),
+    )
+
+    env_note = (
+        f"Credentials saved to <code>{env_path}</code>."
+        if env_saved
+        else (
+            f"Could not write <code>{env_path}</code>; copy "
+            "<code>PLANE_API_KEY</code> and "
+            "<code>PLANE_APP_INSTALLATION_ID</code> manually."
+        )
+    )
+    workspace_note = (
+        f"<p>Workspace: <strong>{workspace_slug}</strong></p>"
+        if workspace_slug
+        else ""
+    )
+
+    return HTMLResponse(
+        content=(
+            "<!DOCTYPE html><html><head><title>Plane Agent Installed</title></head>"
+            "<body style='font-family: system-ui, sans-serif; max-width: 40rem; "
+            "margin: 3rem auto; line-height: 1.5;'>"
+            "<h1>Plane Agent installed</h1>"
+            "<p>The Hermes Plane agent is now authorized for this workspace.</p>"
+            f"{workspace_note}"
+            f"<p>{env_note}</p>"
+            "<p>You can close this tab and @-mention the agent in a work item.</p>"
+            "</body></html>"
+        ),
+        status_code=200,
+    )
+
+
+@app.get("/")
+@app.get("/setup")
+@app.get("/oauth/callback")
+async def setup_page(request: Request) -> Response:
+    """Legacy setup page — redirects to /plane/install or /plane/oauth/callback.
+
+    Maintains backward compatibility with existing OAuth app registration
+    that uses / as Setup URL and /oauth/callback as Redirect URI.
+    """
+    app_installation_id = request.query_params.get("app_installation_id", "")
+    code = request.query_params.get("code", "")
+
+    # If we have an app_installation_id, delegate to the proper callback handler
+    if app_installation_id:
+        # Rebuild the URL with the same query params
+        query = urlencode({
+            k: v for k, v in request.query_params.items()
+        })
+        redirect_url = f"/plane/oauth/callback?{query}"
+        return RedirectResponse(url=redirect_url, status_code=307)
+
+    # Otherwise, show setup info or redirect to install
+    authorize_url = (
+        f"{settings.plane_api_url.rstrip('/')}/auth/o/authorize-app/"
+        f"?client_id={settings.plane_client_id}"
+        f"&response_type=code"
+        f"&redirect_uri={quote(settings.effective_redirect_uri)}"
+        f"&scope=Agent%20Run"
+    ) if settings.oauth_install_ready else ""
+
+    if settings.oauth_install_ready and not code:
+        return RedirectResponse(url="/plane/install", status_code=302)
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><title>Plane Agent — Setup</title>
+<style>
+body {{ font-family: sans-serif; max-width: 600px; margin: 40px auto; line-height: 1.6; }}
+code {{ background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-size: 14px; }}
+</style></head>
+<body>
+<h1>Plane Agent Setup</h1>"""
+    if code:
+        html += f"<p><strong>code:</strong> <code>{code}</code></p>"
+    if authorize_url:
+        html += f'<p><a href="{authorize_url}">Install Plane Agent</a></p>'
+    else:
+        html += (
+            "<p>OAuth install is not configured. Set PLANE_CLIENT_ID, "
+            "PLANE_CLIENT_SECRET, and PLANE_PUBLIC_URL.</p>"
+        )
+    html += "</body></html>"
+    return Response(
+        content=html, media_type="text/html", status_code=200,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"},
     )
 
 
