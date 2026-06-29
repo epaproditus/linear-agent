@@ -3363,6 +3363,11 @@ class AgentWebhookHandler:
         except Exception:
             return "could not check assignment"
 
+        # Skip terminal states — don't re-process completed/canceled issues
+        state_type = payload.get("state", {}).get("type", "") or payload.get("issue", {}).get("state", {}).get("type", "")
+        if state_type in ("completed", "canceled"):
+            return f"skipped ({state_type} issue)"
+
         log.info("Issue %s assigned to agent", issue_id)
         # Create an agent session proactively
         try:
