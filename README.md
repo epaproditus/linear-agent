@@ -190,8 +190,91 @@ uvicorn linear_agent:app --host 0.0.0.0 --port 8660 --reload
 bash bin/linear-agent-wrapper.sh
 ```
 
+## Plane Agent
+
+A companion Plane agent runs on port **8648**. It mirrors the Linear agent's architecture but uses Plane's REST API instead of Linear's GraphQL.
+
+### Architecture
+
+```
+Plane Webhook ──POST──► FastAPI (port 8648)
+                              │
+                     ┌───────┴───────┐
+                     │  HMAC verify   │
+                     │  Rate limiter  │
+                     └───────┬───────┘
+                             │
+                     ┌───────┴───────┐
+                     │  Event Router │
+                     └───────┬───────┘
+                             │
+                     ┌───────┴───────┐
+                     │ TaskProcessor  │
+                     │  (asyncio)     │
+                     └───────┬───────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+        Plane REST API  Hermes API    DiscoveryTracker
+        (activities,   (LLM reasoning) (progress updates)
+         work items,
+         comments)
+```
+
+### Key Differences from Linear Agent
+
+| Aspect | Linear Agent | Plane Agent |
+|--------|-------------|-------------|
+| API style | GraphQL (`api.linear.app/graphql`) | REST (`api.plane.so/api/v1/`) |
+| Port | 8660 | 8648 |
+| Auth | OAuth token | Bot token (Bearer) |
+| Entity | AgentSession | AgentRun |
+| Activity | `AgentActivityCreate` mutation | `POST /agent-runs/{id}/activities/` |
+| Workspace | Team-based routing | Workspace slug required in URL |
+| Issue naming | Issues | Work Items |
+
+### Setup
+
+1. Create an OAuth app in Plane with **Enable App Mentions** and **Agent Run** scopes ([Building a Plane Agent](https://developers.plane.so/dev-tools/agents/building-an-agent))
+2. Complete the Bot Token Flow to get your bot token
+3. Configure the agent via `.env`:
+   ```
+   PLANE_API_KEY=<bot_token>
+   PLANE_WEBHOOK_SECRET=<webhook_secret>
+   PLANE_WORKSPACE_SLUG=epaphroditus
+   HERMES_API_KEY=<same as linear agent>
+   ```
+4. Start the agent:
+   ```bash
+   uvicorn plane_agent:app --host 0.0.0.0 --port 8648
+   ```
+
+### Webhooks
+
+The agent handles two webhook events:
+
+- **agent_run** (`action: created`) — New agent run when user @-mentions the agent
+- **agent_run_activity** (`action: prompted`) — Follow-up message in an existing run
+
+Webhook endpoints: `POST /plane/webhook` or `POST /webhook/plane`
+
+Activities are created at:
+
+```
+POST /api/v1/workspaces/{slug}/agent-runs/{run_id}/activities/
+```
+
+### Implementation Notes
+
+- Uses `httpx` AsyncClient for REST calls (same dependency as Linear agent)
+- Activity types: `thought`, `action`, `response`, `error`, `elicitation`
+- Ephemeral activities (`thought`, `action`) show live progress on the timeline
+- Accepts `X-Plane-Signature` and `X-Hub-Signature-256` webhook headers
+- Workspace slug resolved from config or Plane API
+- Self-hosted Plane supported via `PLANE_API_URL`
+
 ## Related
 
 - [Hermes Agent](https://hermes-agent.nousresearch.com) — The AI agent framework powering this
 - [Linear Agent Session API](https://developers.linear.app/docs/agent/agent-sessions) — Linear's agent integration docs
-- [Plane Agent](https://plane.epaphrodit.us) — Companion project management agent
+- [Plane Agents](https://developers.plane.so/dev-tools/agents/building-an-agent) — Plane's agent integration docs
