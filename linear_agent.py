@@ -128,6 +128,17 @@ HERMES_NATIVE_TODO_HINT = (
     "For multi-step work, use the todo tool to track steps."
 )
 
+GATE_ISSUE_HINT = """
+Human gate issue — help Abraham decide, do not execute:
+- Recommend options, parameters, and findings only.
+- Read-only investigation is fine (logs, docs, data).
+- Do not deploy, change production systems, open PRs, or use delegate_task.
+- Summarize choices for Abraham to confirm in a comment.
+""".strip()
+
+WATERMARK_STORE_DIR = Path.home() / ".linear-agent"
+WATERMARK_STORE_PATH = WATERMARK_STORE_DIR / "conversation_watermarks.json"
+
 # Map embedded shell/git commands to short checklist labels.
 _PLAN_COMMAND_LABELS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"git\s+status", re.I), "Check git status"),
@@ -1492,6 +1503,65 @@ def resolve_user_request(
     return f"Respond to issue {identifier}"
 
 
+def is_human_gate_issue(
+    issue: dict[str, Any],
+    session: AgentSession,
+) -> bool:
+    """Detect Linear human-gate issues (decision required, not implementation)."""
+    combined = "\n".join([
+        issue.get("title") or "",
+        issue.get("description") or "",
+        session.title or "",
+        session.description or "",
+    ])
+    lowered = combined.lower()
+    if "🚧" in combined and "human required" in lowered:
+        return True
+    if "gate — human required" in lowered or "gate - human required" in lowered:
+        return True
+    return False
+
+
+class ConversationWatermarkStore:
+    """Persist per-session comment watermarks across agent restarts."""
+
+    def __init__(self, path: Path = WATERMARK_STORE_PATH) -> None:
+        self._path = path
+        self._cache: dict[str, str] = {}
+        self._load()
+
+    def get(self, session_id: str) -> str:
+        return self._cache.get(session_id, "")
+
+    def set(self, session_id: str, watermark: str) -> None:
+        if not session_id or not watermark:
+            return
+        self._cache[session_id] = watermark
+        self._save()
+
+    def _load(self) -> None:
+        try:
+            if self._path.is_file():
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._cache = {
+                        str(k): str(v) for k, v in data.items() if v
+                    }
+        except Exception:
+            log.debug("Could not load conversation watermarks", exc_info=True)
+            self._cache = {}
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(
+                json.dumps(self._cache, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            log.warning("Could not save conversation watermarks", exc_info=True)
+
+
 # ── Discovery Tracker ──────────────────────────────────────────
 
 
@@ -1635,6 +1705,16 @@ class DiscoveryTracker:
             # Capitalize first letter for natural reading
             return self._keepalive_ctx[0].upper() + self._keepalive_ctx[1:]
         return "Working on it..."
+
+
+def should_finalize_response(
+    session: AgentSession,
+    tracker: DiscoveryTracker | None,
+) -> bool:
+    """Phase-2 rewrite is for first-pass investigation; skip on follow-ups."""
+    if session.action == SessionAction.prompted:
+        return False
+    return bool(tracker and tracker.tool_progress)
 
 
 @dataclass
@@ -2438,6 +2518,7 @@ class TaskProcessor:
         skills_context: str = "",
         plan_steps: list[str] | None = None,
         project_issues_block: str = "",
+        gate_mode: bool = False,
         relations_block: str = "",
     ) -> str:
         """Assemble the full LLM prompt from session + issue context.
@@ -2501,6 +2582,7 @@ class TaskProcessor:
             f"{conversation_text}\n"
             f"{internal_text}\n"
         )
+        gate_block = f"\n{GATE_ISSUE_HINT}\n" if gate_mode else ""
 
         if session.action == SessionAction.prompted:
             # Follow-up turn — continue the work/conversation in this thread
@@ -2529,6 +2611,7 @@ class TaskProcessor:
                 f"Investigate with your tools, then produce a thorough internal"
                 f" draft. Tool actions appear on the Linear timeline as they"
                 f" run; a separate pass will write the user-facing reply.\n"
+                f"{gate_block}"
                 f"\n"
                 f"{HERMES_WORK_STYLE}\n"
                 f"\n"
@@ -2565,6 +2648,7 @@ class TaskProcessor:
                 f"Investigate with your tools, then produce a thorough internal"
                 f" draft. Tool actions appear on the Linear timeline as they"
                 f" run; a separate pass will write the user-facing reply.\n"
+                f"{gate_block}"
                 f"\n"
                 f"{HERMES_WORK_STYLE}\n"
                 f"\n"
@@ -2585,6 +2669,7 @@ class TaskProcessor:
         project_issues_block: str = "",
         relations_block: str = "",
         include_full_context: bool = True,
+        gate_mode: bool = False,
     ) -> str:
         """Minimal turn payload for Hermes-native mode (one session per assignment)."""
         identifier = issue.get("identifier", session.issue_identifier)
@@ -2622,14 +2707,21 @@ class TaskProcessor:
                 parts.append(f"Issue description:\n{description}")
             if conversation_text.strip():
                 parts.append(conversation_text.strip())
-            parts.extend([
+            tail = [
                 f"User request:\n{user_request}",
-                HERMES_NATIVE_TODO_HINT,
-                (
-                    "Confirm target hosts (VPS, staging, prod) from project "
-                    "overview, comments, or sibling issues before SSH, PAM, "
-                    "firewall, or package changes."
-                ),
+            ]
+            if gate_mode:
+                tail.append(GATE_ISSUE_HINT)
+            else:
+                tail.extend([
+                    HERMES_NATIVE_TODO_HINT,
+                    (
+                        "Confirm target hosts (VPS, staging, prod) from project "
+                        "overview, comments, or sibling issues before SSH, PAM, "
+                        "firewall, or package changes."
+                    ),
+                ])
+            tail.extend([
                 (
                     "LINEAR_API_KEY is available as $LINEAR_API_KEY for "
                     "GraphQL calls to api.linear.app if needed."
@@ -2637,10 +2729,16 @@ class TaskProcessor:
                 LINEAR_OUTPUT_RULES,
                 (
                     "Investigate with your tools. Tool progress appears on "
-                    "the Linear timeline; a follow-up pass may rewrite your "
-                    "final reply for the user."
+                    "the Linear timeline"
+                    + (
+                        "; reply with recommendations for Abraham to decide."
+                        if gate_mode
+                        else "; a follow-up pass may rewrite your final reply "
+                        "for the user."
+                    )
                 ),
             ])
+            parts.extend(tail)
             return "\n\n".join(parts)
 
         # Follow-up turn — delta only; Hermes session retains prior work.
@@ -2651,6 +2749,8 @@ class TaskProcessor:
         ]
         if conversation_text.strip():
             parts.append(conversation_text.strip())
+        if gate_mode:
+            parts.append(GATE_ISSUE_HINT)
         if relations_block:
             parts.append(relations_block.rstrip())
         if unfinished_blockers(issue):
@@ -2861,6 +2961,7 @@ class TaskProcessor:
             since_watermark=conversation_since if use_delta else None,
         )
         relations_block = format_issue_relations_block(issue)
+        gate_mode = is_human_gate_issue(issue, session)
 
         plan = SessionPlanTracker(session_id=session_id, linear=self.linear)
 
@@ -2881,9 +2982,12 @@ class TaskProcessor:
                 project_issues_block=project_issues_block,
                 relations_block=relations_block,
                 include_full_context=(session.action != SessionAction.prompted),
+                gate_mode=gate_mode,
             )
-            log.info("Hermes native mode: session=%s action=%s",
-                     session_id[:8], session.action.value)
+            log.info(
+                "Hermes native mode: session=%s action=%s gate=%s",
+                session_id[:8], session.action.value, gate_mode,
+            )
         else:
             project = issue.get("project") or {}
             project_block = format_project_context_block(
@@ -2922,6 +3026,7 @@ class TaskProcessor:
                 skills_context=skills_context,
                 plan_steps=hermes_steps or [s["content"] for s in plan.steps],
                 project_issues_block=project_issues_block,
+                gate_mode=gate_mode,
                 relations_block=relations_block,
             )
 
@@ -2950,7 +3055,7 @@ class TaskProcessor:
                 await tracker.flush()
 
             response_text = draft_text
-            if tracker and tracker.tool_progress:
+            if should_finalize_response(session, tracker):
                 finalized = await self._call_llm_finalize(
                     draft=draft_text,
                     user_request=user_request,
@@ -2983,8 +3088,11 @@ class TaskProcessor:
                 await self._sync_plan_from_hermes_todos(plan, session_id)
             await plan.finish()
             await self.linear.send_response(session_id, response_text)
-            # Task complete — move to "In Review" for the user
-            if session.action != SessionAction.prompted:
+            # Task complete — move to "In Review" for the user (not gate issues)
+            if (
+                session.action != SessionAction.prompted
+                and not gate_mode
+            ):
                 team_id_local = issue.get("team", {}).get("id", session.team_id)
                 issue_id_local = issue.get("id", "")
                 if team_id_local and issue_id_local:
@@ -3370,7 +3478,7 @@ class AgentWebhookHandler:
         self.processor = processor
         self._active_runs: dict[str, asyncio.Task[None]] = {}
         self._dedup_cache: dict[str, float] = {}
-        self._conversation_watermarks: dict[str, str] = {}
+        self._watermark_store = ConversationWatermarkStore()
         # Rate limiting
         self._concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
         self._rate_limiter = SlidingWindowRateLimiter(
@@ -3571,7 +3679,7 @@ class AgentWebhookHandler:
         async with self._concurrency_semaphore:
             try:
                 issue = await self.linear.get_issue(session.issue_id)
-                conversation_since = self._conversation_watermarks.get(
+                conversation_since = self._watermark_store.get(
                     session.session_id,
                 )
                 watermark = await self.processor.process(
@@ -3580,7 +3688,7 @@ class AgentWebhookHandler:
                     conversation_since=conversation_since or None,
                 )
                 if watermark:
-                    self._conversation_watermarks[session.session_id] = watermark
+                    self._watermark_store.set(session.session_id, watermark)
             except asyncio.CancelledError:
                 log.info("Session %s cancelled via stop signal", session.session_id[:8])
                 raise
@@ -3606,16 +3714,14 @@ class AgentWebhookHandler:
         processing directly without going through _run_session.
         """
         async with self._concurrency_semaphore:
-            conversation_since = self._conversation_watermarks.get(
-                session.session_id,
-            )
+            conversation_since = self._watermark_store.get(session.session_id)
             watermark = await self.processor.process(
                 session,
                 issue,
                 conversation_since=conversation_since or None,
             )
             if watermark:
-                self._conversation_watermarks[session.session_id] = watermark
+                self._watermark_store.set(session.session_id, watermark)
 
     async def _handle_comment(self, payload: dict[str, Any]) -> str:
         """Handle @mentions in comments."""
