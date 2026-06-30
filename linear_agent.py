@@ -1195,6 +1195,147 @@ def _format_comment_line(depth: int, c: dict[str, Any]) -> str:
     return f"[{ts}] {prefix}{author}: {body}"
 
 
+def _normalize_comment_body(body: str) -> str:
+    return " ".join((body or "").split())
+
+
+def _comment_sort_key(c: dict[str, Any]) -> tuple[str, str]:
+    return (c.get("createdAt") or "", c.get("id") or "")
+
+
+def dedupe_threaded_comments(
+    flat: list[tuple[int, dict[str, Any]]],
+) -> list[tuple[int, dict[str, Any]]]:
+    """Drop threaded children that repeat the parent comment body."""
+    deduped: list[tuple[int, dict[str, Any]]] = []
+    for i, (depth, c) in enumerate(flat):
+        if depth > 0:
+            parent_body = ""
+            for j in range(i - 1, -1, -1):
+                if flat[j][0] == depth - 1:
+                    parent_body = flat[j][1].get("body", "") or ""
+                    break
+            if _normalize_comment_body(parent_body) == _normalize_comment_body(
+                c.get("body", "") or "",
+            ):
+                continue
+        deduped.append((depth, c))
+    return deduped
+
+
+def encode_conversation_watermark(flat: list[tuple[int, dict[str, Any]]]) -> str:
+    """Encode the latest comment position for delta injection on follow-ups."""
+    if not flat:
+        return ""
+    _, latest = max(flat, key=lambda item: _comment_sort_key(item[1]))
+    created_at, comment_id = _comment_sort_key(latest)
+    return f"{created_at}\x00{comment_id}"
+
+
+def _decode_watermark(watermark: str) -> tuple[str, str]:
+    if not watermark:
+        return ("", "")
+    if "\x00" in watermark:
+        created_at, comment_id = watermark.split("\x00", 1)
+        return (created_at, comment_id)
+    return (watermark, "")
+
+
+def filter_comments_since_watermark(
+    flat: list[tuple[int, dict[str, Any]]],
+    watermark: str | None,
+) -> list[tuple[int, dict[str, Any]]]:
+    if not watermark:
+        return flat
+    since = _decode_watermark(watermark)
+    return [
+        item for item in flat
+        if _comment_sort_key(item[1]) > since
+    ]
+
+
+def build_conversation_text(
+    flat: list[tuple[int, dict[str, Any]]],
+    *,
+    since_watermark: str | None = None,
+) -> str:
+    """Format issue comments for prompt injection (full or delta since watermark)."""
+    if not flat:
+        return ""
+    sorted_flat = sorted(flat, key=lambda item: _comment_sort_key(item[1]))
+    if since_watermark:
+        comments = filter_comments_since_watermark(sorted_flat, since_watermark)
+        if not comments:
+            return ""
+        header = "New comments since your last turn:"
+    else:
+        comments = sorted_flat
+        header = "Full conversation (all comments, chronological):"
+    lines = [header]
+    for depth, c in comments:
+        lines.append(_format_comment_line(depth, c))
+    return "\n\n" + "\n".join(lines) + "\n"
+
+
+def _is_agent_author(name: str, agent_bot_name: str) -> bool:
+    lowered = (name or "").strip().lower()
+    if not lowered:
+        return False
+    bot = agent_bot_name.strip().lower()
+    return lowered == bot or lowered == "hermes"
+
+
+def resolve_user_request(
+    session: AgentSession,
+    issue: dict[str, Any],
+    *,
+    description: str,
+    agent_bot_name: str,
+    flat_comments: list[tuple[int, dict[str, Any]]],
+    since_watermark: str | None = None,
+) -> str:
+    """Resolve the user message for this turn.
+
+    Prompted turns must never fall back to the issue description (gate templates
+    are not the user's new message). When the webhook body is empty, use the
+    latest human comment — preferring comments newer than ``since_watermark``.
+    """
+    identifier = issue.get("identifier", session.issue_identifier)
+    body = (session.body or "").strip()
+    if body and not _is_linear_system_comment(body):
+        return body
+
+    sorted_flat = sorted(flat_comments, key=lambda item: _comment_sort_key(item[1]))
+
+    def _latest_human_comment(
+        candidates: list[tuple[int, dict[str, Any]]],
+    ) -> str:
+        for _, c in reversed(candidates):
+            comment_body = (c.get("body") or "").strip()
+            if not comment_body or _is_linear_system_comment(comment_body):
+                continue
+            author = (c.get("user") or {}).get("name", "")
+            if _is_agent_author(author, agent_bot_name):
+                continue
+            return comment_body
+        return ""
+
+    if session.action == SessionAction.prompted:
+        if since_watermark:
+            delta = filter_comments_since_watermark(sorted_flat, since_watermark)
+            latest = _latest_human_comment(delta)
+            if latest:
+                return latest
+        latest = _latest_human_comment(sorted_flat)
+        if latest:
+            return latest
+        return f"Follow up on {identifier}"
+
+    if description.strip():
+        return description.strip()
+    return f"Respond to issue {identifier}"
+
+
 # ── Discovery Tracker ──────────────────────────────────────────
 
 
@@ -2036,9 +2177,17 @@ class TaskProcessor:
         return f"{response_text.rstrip()}\n\n**{heading}:**\n{lines}\n"
 
     async def process(
-        self, session: AgentSession, issue: dict[str, Any] | None
-    ) -> None:
-        """Main processing pipeline for a session."""
+        self,
+        session: AgentSession,
+        issue: dict[str, Any] | None,
+        *,
+        conversation_since: str | None = None,
+    ) -> str:
+        """Main processing pipeline for a session.
+
+        Returns a conversation watermark (latest comment seen) for follow-up
+        delta injection.
+        """
         session_id = session.session_id
         issue_id = session.issue_id
         log.info(
@@ -2060,7 +2209,7 @@ class TaskProcessor:
                     session_id,
                     f"Could not fetch issue {session.issue_identifier}.",
                 )
-                return
+                return ""
 
             title = issue.get("title", session.title)
             description = issue.get("description", session.description) or ""
@@ -2094,7 +2243,12 @@ class TaskProcessor:
             # 6. Always route to Hermes LLM reasoning — Hermes has filesystem tools,
             #    terminal access, and everything it needs. Let it decide if coding is needed.
             log.info("Routing to _handle_analysis")
-            await self._handle_analysis(session, issue, session_id)
+            return await self._handle_analysis(
+                session,
+                issue,
+                session_id,
+                conversation_since=conversation_since,
+            )
 
         except asyncio.CancelledError:
             raise
@@ -2104,6 +2258,7 @@ class TaskProcessor:
                 session_id,
                 f"An error occurred while processing this issue:\n```\n{e}\n```",
             )
+            return conversation_since or ""
 
     def build_llm_prompt(
         self,
@@ -2128,7 +2283,8 @@ class TaskProcessor:
         6. Conversation thread (all comments, chronological, full body)
         7. Prior session activity (tool calls, thoughts — prompted sessions only)
         8. Session plan checklist
-        9. User's message (session.body or description fallback)
+        9. User's message (resolved via resolve_user_request — never issue
+           description on prompted follow-ups)
         10. Instruction: context-first work style, then act
 
         See PLY-32 for the full spec.
@@ -2485,38 +2641,45 @@ class TaskProcessor:
         session: AgentSession,
         issue: dict[str, Any],
         session_id: str,
-    ) -> None:
+        *,
+        conversation_since: str | None = None,
+    ) -> str:
         """Non-coding task: use LLM to reason and respond intelligently."""
         identifier = issue.get("identifier", session.issue_identifier)
         description = issue.get("description", session.description) or ""
         title = issue.get("title", session.title) or ""
 
-        # ── Deterministic conversation reconstruction ──
-        # Always show ALL issue comments chronologically (full body, no truncation).
-        # This is deterministic — survives provider failures, session resets, and
-        # stale activities. The LLM never has to guess what was said earlier.
-        conversation_text = ""
         raw_nodes = issue.get("comments", {}).get("nodes", []) or []
-        flat = _flatten_comments(raw_nodes)
-        if flat:
-            # Sort ALL comments chronologically for a coherent conversation view
-            flat.sort(key=lambda item: item[1].get("createdAt", ""))
-            conversation_text = "\n\nFull conversation (all comments, chronological):\n"
-            for depth, c in flat:
-                conversation_text += _format_comment_line(depth, c) + "\n"
+        flat = dedupe_threaded_comments(_flatten_comments(raw_nodes))
+        watermark_out = encode_conversation_watermark(flat)
+
+        use_delta = (
+            session.action == SessionAction.prompted
+            and bool(conversation_since)
+        )
+        conversation_text = build_conversation_text(
+            flat,
+            since_watermark=conversation_since if use_delta else None,
+        )
 
         # For prompted sessions, ALSO include session activities (tool calls,
         # thoughts, internal reasoning) as supplementary context above the comments.
         internal_text = ""
-        if session.action == SessionAction.prompted:
+        if session.action == SessionAction.prompted and not settings.hermes_native_mode:
             activities = await self.linear.get_session_activities(session_id)
             if activities:
                 internal_text = _format_activities_conversation(activities)
                 if internal_text:
                     internal_text = "\n\nPrior session activity (Hermes internal):\n" + internal_text
 
-        # The user's actual request (from the comment that triggered this)
-        user_request = session.body or description or f"Respond to issue {identifier}"
+        user_request = resolve_user_request(
+            session,
+            issue,
+            description=description,
+            agent_bot_name=settings.linear_agent_bot_name,
+            flat_comments=flat,
+            since_watermark=conversation_since if use_delta else None,
+        )
 
         plan = SessionPlanTracker(session_id=session_id, linear=self.linear)
 
@@ -2652,6 +2815,8 @@ class TaskProcessor:
                 session_id,
                 f"Could not generate a response. Status: {issue.get('state', {}).get('name', 'Unknown')}",
             )
+
+        return watermark_out
 
     async def _call_llm(
         self, prompt: str, session_id: str = "",
@@ -3022,6 +3187,7 @@ class AgentWebhookHandler:
         self.processor = processor
         self._active_runs: dict[str, asyncio.Task[None]] = {}
         self._dedup_cache: dict[str, float] = {}
+        self._conversation_watermarks: dict[str, str] = {}
         # Rate limiting
         self._concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
         self._rate_limiter = SlidingWindowRateLimiter(
@@ -3141,7 +3307,7 @@ class AgentWebhookHandler:
         # For prompted events, the new user message is in agentActivity.body.
         # For created events, only a real @mention comment counts as user content.
         if action == SessionAction.prompted:
-            user_body = activity_body or ""
+            user_body = activity_body or comment_body or ""
         else:
             user_body = comment_body or ""
 
@@ -3222,7 +3388,16 @@ class AgentWebhookHandler:
         async with self._concurrency_semaphore:
             try:
                 issue = await self.linear.get_issue(session.issue_id)
-                await self.processor.process(session, issue)
+                conversation_since = self._conversation_watermarks.get(
+                    session.session_id,
+                )
+                watermark = await self.processor.process(
+                    session,
+                    issue,
+                    conversation_since=conversation_since or None,
+                )
+                if watermark:
+                    self._conversation_watermarks[session.session_id] = watermark
             except asyncio.CancelledError:
                 log.info("Session %s cancelled via stop signal", session.session_id[:8])
                 raise
@@ -3248,7 +3423,16 @@ class AgentWebhookHandler:
         processing directly without going through _run_session.
         """
         async with self._concurrency_semaphore:
-            await self.processor.process(session, issue)
+            conversation_since = self._conversation_watermarks.get(
+                session.session_id,
+            )
+            watermark = await self.processor.process(
+                session,
+                issue,
+                conversation_since=conversation_since or None,
+            )
+            if watermark:
+                self._conversation_watermarks[session.session_id] = watermark
 
     async def _handle_comment(self, payload: dict[str, Any]) -> str:
         """Handle @mentions in comments."""

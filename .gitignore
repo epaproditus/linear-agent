@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 workspace/
+untitled-session-*.json
+session_*.json
