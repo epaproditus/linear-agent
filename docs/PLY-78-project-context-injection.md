@@ -129,6 +129,18 @@ Team/workspace guidance:
 
 **Not included:** Raw `promptContext` XML, project documents/milestones/members (unless agent fetches via tools).
 
+### Context-before-action (infrastructure / SSH tasks)
+
+Hermes is explicitly guided to **read before acting**:
+
+1. **Execution environment block** — states the agent host hostname and default working directory; clarifies that shell tools run there unless the agent explicitly SSHs elsewhere.
+2. **Prompt ordering** — project overview, sibling issues, guidance, and the full comment thread appear **before** the user request and plan checklist.
+3. **Sibling project issues** — when the issue has a project, Hermes fetches up to 8 recently updated issues in that project (title, status, description excerpt) so VPS/host context from prior work is visible even on a new issue.
+4. **Work style rules** — require identifying target host from thread/project text before PAM, SSH, firewall, or package changes.
+5. **Session plan** — planning prompt and fallback checklist start with "Review project context", "Read issue thread", "Confirm target host" before tool work.
+
+**Operational tip:** Document default SSH targets (hostname, alias, environment) in the **project overview** or a dedicated infra issue in the same project — sibling-issue injection picks that up automatically.
+
 ### Other context that *is* injected
 
 | Block | Source | Notes |
