@@ -195,3 +195,10 @@ bash bin/linear-agent-wrapper.sh
 - [Hermes Agent](https://hermes-agent.nousresearch.com) — The AI agent framework powering this
 - [Linear Agent Session API](https://developers.linear.app/docs/agent/agent-sessions) — Linear's agent integration docs
 - [Plane Agent](https://plane.epaphrodit.us) — Companion project management agent
+
+### Internal docs
+
+- [Architecture and session learnings](docs/linear-agent-architecture-and-learnings.md) — redesign narrative, PLY-112 analysis, deploy checklist
+- [Hermes-native mode](docs/hermes-native-mode.md) — flag-gated thin adapter
+- [PLY-78 project context](docs/PLY-78-project-context-injection.md) — what reaches the LLM
+- [Linear status comment (paste-ready)](docs/linear-activity-status-2026-06-30.md) — post on an issue or agent thread

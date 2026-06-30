@@ -1,8 +1,10 @@
 # Hermes-native mode
 
-**Status:** implemented (flag-gated)  
-**Flag:** `HERMES_NATIVE_MODE=1`  
-**Date:** 2026-06-28
+**Status:** implemented and merged (PR #17); companion fixes in #18–#20  
+**Flag:** `HERMES_NATIVE_MODE=1` (recommended for production)  
+**Date:** 2026-06-30
+
+**See also:** [linear-agent-architecture-and-learnings.md](./linear-agent-architecture-and-learnings.md) for the full redesign narrative, PLY-112 session analysis, and operational checklist.
 
 ## Goal
 
@@ -42,6 +44,18 @@ Omits: agent identity boilerplate, execution-environment block, skills catalog, 
 ## Rollback
 
 Set `HERMES_NATIVE_MODE=0` (default) to restore legacy `:plan` / fallback / `plan.advance()` behavior.
+
+## Companion features (merged with native mode)
+
+These work in both native and legacy modes unless noted:
+
+| Feature | Flag / behavior | PR |
+|---------|-----------------|-----|
+| Prompted user message + comment deltas | Always on | #18 |
+| Skip finalize on follow-ups | Always on | #19 |
+| Gate issue lightweight profile | `🚧` + Human Required in description | #19 |
+| Conversation watermark persistence | `~/.linear-agent/conversation_watermarks.json` | #19 |
+| Blocked-by relations + deferral | `LINEAR_DEFER_ON_BLOCKERS` (default true) | #20 |
 
 ## Follow-up (not in this slice)
 
