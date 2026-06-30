@@ -193,6 +193,9 @@ class Settings(BaseSettings):
     hermes_native_mode: bool = False
     """Thin Hermes-native adapter: one session, todo→plan, no synthetic planning."""
 
+    linear_defer_on_blockers: bool = True
+    """Refuse new work on created turns when blocked by unfinished issues."""
+
     @property
     def allowed_team_ids(self) -> set[str]:
         """Team IDs from LINEAR_TEAM_IDS and/or ALLOWED_TEAM_IDS."""
@@ -280,6 +283,28 @@ query Issue($id: String!) {
             createdAt
             user { id name }
           }
+        }
+      }
+    }
+    relations {
+      nodes {
+        type
+        relatedIssue {
+          id
+          identifier
+          title
+          state { name type }
+        }
+      }
+    }
+    inverseRelations {
+      nodes {
+        type
+        issue {
+          id
+          identifier
+          title
+          state { name type }
         }
       }
     }
@@ -1079,6 +1104,137 @@ def format_project_issues_block(issues: list[dict[str, Any]]) -> str:
         detail = f": {desc}" if desc else ""
         lines.append(f"- {ident}{state_part} {title}{detail}")
     return "\n".join(lines) + "\n"
+
+
+_TERMINAL_STATE_TYPES = frozenset({"completed", "canceled"})
+
+
+def _relation_issue_summary(issue_node: dict[str, Any] | None) -> dict[str, str]:
+    if not issue_node:
+        return {}
+    state = issue_node.get("state") or {}
+    return {
+        "identifier": issue_node.get("identifier", ""),
+        "title": (issue_node.get("title") or "").strip(),
+        "state_name": (state.get("name") or "").strip(),
+        "state_type": (state.get("type") or "").strip(),
+    }
+
+
+def extract_issue_relations(issue: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+    """Parse Linear issue relations (blocks / blocked by / related / duplicate)."""
+    blockers: list[dict[str, str]] = []
+    blocking: list[dict[str, str]] = []
+    related: list[dict[str, str]] = []
+    duplicate: list[dict[str, str]] = []
+
+    for rel in issue.get("inverseRelations", {}).get("nodes", []) or []:
+        if not rel:
+            continue
+        rtype = (rel.get("type") or "").lower()
+        summary = _relation_issue_summary(rel.get("issue"))
+        if not summary.get("identifier"):
+            continue
+        if rtype == "blocks":
+            blockers.append(summary)
+        elif rtype == "related":
+            related.append(summary)
+        elif rtype == "duplicate":
+            duplicate.append(summary)
+
+    for rel in issue.get("relations", {}).get("nodes", []) or []:
+        if not rel:
+            continue
+        rtype = (rel.get("type") or "").lower()
+        summary = _relation_issue_summary(rel.get("relatedIssue"))
+        if not summary.get("identifier"):
+            continue
+        if rtype == "blocks":
+            blocking.append(summary)
+        elif rtype == "related":
+            related.append(summary)
+        elif rtype == "duplicate":
+            duplicate.append(summary)
+
+    return {
+        "blockers": blockers,
+        "blocking": blocking,
+        "related": related,
+        "duplicate": duplicate,
+    }
+
+
+def unfinished_blockers(issue: dict[str, Any]) -> list[dict[str, str]]:
+    """Issues blocking this one that are not completed or canceled."""
+    return [
+        blocker
+        for blocker in extract_issue_relations(issue)["blockers"]
+        if (blocker.get("state_type") or "").lower() not in _TERMINAL_STATE_TYPES
+    ]
+
+
+def should_defer_for_blockers(
+    issue: dict[str, Any],
+    session: AgentSession,
+) -> bool:
+    """Defer investigation on new sessions when open blockers exist."""
+    if not settings.linear_defer_on_blockers:
+        return False
+    if session.action != SessionAction.created:
+        return False
+    return bool(unfinished_blockers(issue))
+
+
+def _format_relation_lines(
+    heading: str,
+    items: list[dict[str, str]],
+) -> list[str]:
+    if not items:
+        return []
+    lines = [heading]
+    for item in items:
+        status = item.get("state_name") or item.get("state_type") or "Unknown"
+        title = item.get("title") or ""
+        ident = item.get("identifier") or ""
+        detail = f": {title}" if title else ""
+        lines.append(f"- {ident} [{status}]{detail}")
+    return lines
+
+
+def format_issue_relations_block(issue: dict[str, Any]) -> str:
+    """Format issue relations for prompt injection."""
+    rels = extract_issue_relations(issue)
+    lines: list[str] = []
+    lines.extend(_format_relation_lines("Blocked by:", rels["blockers"]))
+    lines.extend(_format_relation_lines("Blocks:", rels["blocking"]))
+    lines.extend(_format_relation_lines("Related:", rels["related"]))
+    lines.extend(_format_relation_lines("Duplicate of:", rels["duplicate"]))
+    if not lines:
+        return ""
+    return "Issue relations:\n" + "\n".join(lines) + "\n"
+
+
+def format_blocked_deferral_message(
+    identifier: str,
+    blockers: list[dict[str, str]],
+) -> str:
+    """User-facing message when deferring work on a blocked issue."""
+    lines = [
+        f"I have not started work on **{identifier}** — it is still blocked.",
+        "",
+        "**Blocked by:**",
+    ]
+    for blocker in blockers:
+        status = blocker.get("state_name") or blocker.get("state_type") or "Unknown"
+        ident = blocker.get("identifier") or "?"
+        title = blocker.get("title") or ""
+        lines.append(f"- **{ident}** [{status}] — {title}")
+    lines.extend([
+        "",
+        "Complete or unblock the issue(s) above first. Mention me again on "
+        "this issue when ready, or reply in this thread to override.",
+    ])
+    return "\n".join(lines)
 
 
 def summarize_conversation_text(conversation_text: str, limit: int = CONVERSATION_SUMMARY_MAX) -> str:
@@ -2219,6 +2375,27 @@ class TaskProcessor:
                       (issue.get("labels", {}).get("nodes", []) or [])]
             log.info("Issue: %s — %s [%s]", session.issue_identifier, title, state_type)
 
+            # Acknowledge session early (Linear 10s requirement).
+            await self.linear.update_session(
+                session_id,
+                external_urls=[
+                    {"label": "Issue", "url": issue.get("url", "")},
+                ],
+            )
+
+            if should_defer_for_blockers(issue, session):
+                blockers = unfinished_blockers(issue)
+                identifier = issue.get("identifier", session.issue_identifier)
+                await self.linear.send_response(
+                    session_id,
+                    format_blocked_deferral_message(identifier, blockers),
+                )
+                log.info(
+                    "Deferred session %s — %d open blocker(s)",
+                    session_id[:8], len(blockers),
+                )
+                return ""
+
             # 3. Set self as delegate if not already set (per Linear best practices)
             if issue.get("delegate") is None:
                 viewer_id = await self.ensure_viewer_id()
@@ -2232,16 +2409,7 @@ class TaskProcessor:
                 if started_id:
                     await self.linear.update_issue(issue_id, stateId=started_id)
 
-            # 5. Enable agent session with external URL (satisfies 10s ack requirement)
-            await self.linear.update_session(
-                session_id,
-                external_urls=[
-                    {"label": "Issue", "url": issue.get("url", "")},
-                ],
-            )
-
-            # 6. Always route to Hermes LLM reasoning — Hermes has filesystem tools,
-            #    terminal access, and everything it needs. Let it decide if coding is needed.
+            # 6. Route to Hermes LLM reasoning
             log.info("Routing to _handle_analysis")
             return await self._handle_analysis(
                 session,
@@ -2270,6 +2438,7 @@ class TaskProcessor:
         skills_context: str = "",
         plan_steps: list[str] | None = None,
         project_issues_block: str = "",
+        relations_block: str = "",
     ) -> str:
         """Assemble the full LLM prompt from session + issue context.
 
@@ -2327,6 +2496,7 @@ class TaskProcessor:
             f"{execution_block}\n"
             f"{project_block}"
             f"{project_issues_block}"
+            f"{relations_block}"
             f"{guidance_block}"
             f"{conversation_text}\n"
             f"{internal_text}\n"
@@ -2413,6 +2583,7 @@ class TaskProcessor:
         *,
         conversation_text: str = "",
         project_issues_block: str = "",
+        relations_block: str = "",
         include_full_context: bool = True,
     ) -> str:
         """Minimal turn payload for Hermes-native mode (one session per assignment)."""
@@ -2443,6 +2614,8 @@ class TaskProcessor:
                 parts.append(project_block.rstrip())
             if project_issues_block:
                 parts.append(project_issues_block.rstrip())
+            if relations_block:
+                parts.append(relations_block.rstrip())
             if guidance_block:
                 parts.append(guidance_block.rstrip())
             if description:
@@ -2478,6 +2651,13 @@ class TaskProcessor:
         ]
         if conversation_text.strip():
             parts.append(conversation_text.strip())
+        if relations_block:
+            parts.append(relations_block.rstrip())
+        if unfinished_blockers(issue):
+            parts.append(
+                "Note: this issue still has unfinished blockers. "
+                "Confirm with the user before substantial implementation work."
+            )
         parts.append(LINEAR_OUTPUT_RULES)
         return "\n\n".join(parts)
 
@@ -2680,6 +2860,7 @@ class TaskProcessor:
             flat_comments=flat,
             since_watermark=conversation_since if use_delta else None,
         )
+        relations_block = format_issue_relations_block(issue)
 
         plan = SessionPlanTracker(session_id=session_id, linear=self.linear)
 
@@ -2698,6 +2879,7 @@ class TaskProcessor:
                 user_request,
                 conversation_text=conversation_text,
                 project_issues_block=project_issues_block,
+                relations_block=relations_block,
                 include_full_context=(session.action != SessionAction.prompted),
             )
             log.info("Hermes native mode: session=%s action=%s",
@@ -2740,6 +2922,7 @@ class TaskProcessor:
                 skills_context=skills_context,
                 plan_steps=hermes_steps or [s["content"] for s in plan.steps],
                 project_issues_block=project_issues_block,
+                relations_block=relations_block,
             )
 
         # Initialize DiscoveryTracker for result-oriented progress updates
