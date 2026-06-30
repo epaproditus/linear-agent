@@ -103,6 +103,21 @@ _PLAN_DONE = "completed"
 PLAN_STEP_MAX_LEN = 48
 PLAN_MAX_STEPS = 5
 PLAN_STEP_MAX_WORDS = 6
+PROJECT_CONTEXT_MAX_LEN = 4000
+PROJECT_SIBLING_ISSUES_MAX = 8
+PROJECT_SIBLING_DESC_MAX = 200
+
+LINEAR_OUTPUT_RULES = """
+Linear output rules:
+- The user already sees tool progress on the issue timeline.
+- Your final message here should be conclusions, findings, and decisions only.
+- For code changes: include the GitHub PR URL. Do not paste large diffs.
+- Reference existing code with ```startLine:endLine:filepath citations when helpful.
+""".strip()
+
+HERMES_NATIVE_TODO_HINT = (
+    "For multi-step work, use the todo tool to track steps."
+)
 
 # Map embedded shell/git commands to short checklist labels.
 _PLAN_COMMAND_LABELS: list[tuple[re.Pattern[str], str]] = [
@@ -169,6 +184,9 @@ class Settings(BaseSettings):
     coding_workdir: str = str(Path.home() / "linear-agent" / "workspace")
     """Working directory for coding agents."""
 
+    hermes_native_mode: bool = False
+    """Thin Hermes-native adapter: one session, todo→plan, no synthetic planning."""
+
     @property
     def allowed_team_ids(self) -> set[str]:
         """Team IDs from LINEAR_TEAM_IDS and/or ALLOWED_TEAM_IDS."""
@@ -232,7 +250,14 @@ query Issue($id: String!) {
     url
     state { id name type }
     team { id key name }
-    project { id name }
+    project {
+      id
+      name
+      description
+      content
+      url
+      status { name type }
+    }
     assignee { id name email }
     delegate { id name email }
     labels { nodes { id name } }
@@ -251,6 +276,25 @@ query Issue($id: String!) {
           }
         }
       }
+    }
+  }
+}
+"""
+
+GQL_PROJECT_ISSUES = """
+query ProjectIssues($projectId: ID!, $first: Int!) {
+  issues(
+    filter: { project: { id: { eq: $projectId } } }
+    first: $first
+    orderBy: updatedAt
+  ) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      updatedAt
+      state { name }
     }
   }
 }
@@ -423,6 +467,8 @@ class AgentSession:
     state_type: str = ""
     comments: list[dict] = field(default_factory=list)
     guidance: list[str] = field(default_factory=list)
+    project_name: str = ""
+    project_summary: str = ""
     previous_activities: list[dict] = field(default_factory=list)
 
 
@@ -505,6 +551,63 @@ class LinearClient:
             return data.get("issue")
         except RuntimeError:
             return None
+
+    async def get_project_issue_summaries(
+        self,
+        project_id: str,
+        exclude_issue_id: str = "",
+        limit: int = PROJECT_SIBLING_ISSUES_MAX,
+    ) -> list[dict[str, Any]]:
+        """Recent issues in the same project (for cross-issue context)."""
+        if not project_id:
+            return []
+        try:
+            data = await self._gql(
+                GQL_PROJECT_ISSUES,
+                {"projectId": project_id, "first": limit + 4},
+            )
+            nodes = data.get("issues", {}).get("nodes", []) or []
+            out: list[dict[str, Any]] = []
+            for node in nodes:
+                if exclude_issue_id and node.get("id") == exclude_issue_id:
+                    continue
+                out.append(node)
+                if len(out) >= limit:
+                    break
+            return out
+        except RuntimeError:
+            log.debug("Could not fetch project issues for %s", project_id[:8])
+            return []
+
+    async def fetch_hermes_todos(self, hermes_session_id: str) -> list[dict[str, Any]]:
+        """Read Hermes native todo list for a session (GET /api/todos/{id})."""
+        if not settings.hermes_api_key or not hermes_session_id:
+            return []
+        base = settings.hermes_api_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        url = f"{base}/api/todos/{hermes_session_id}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {settings.hermes_api_key}"},
+                )
+                if resp.status_code == 404:
+                    return []
+                if resp.status_code != 200:
+                    log.debug("Hermes todos API returned %d", resp.status_code)
+                    return []
+                data = resp.json()
+                if isinstance(data, dict):
+                    todos = data.get("todos")
+                    if isinstance(todos, list):
+                        return [t for t in todos if isinstance(t, dict)]
+                if isinstance(data, list):
+                    return [t for t in data if isinstance(t, dict)]
+        except Exception:
+            log.debug("Could not fetch Hermes todos", exc_info=True)
+        return []
 
     async def comment(self, issue_id: str, body: str, parent_id: str | None = None) -> bool:
         """Add a comment to an issue, optionally as a threaded reply."""
@@ -1043,7 +1146,127 @@ def parse_prompt_context(xml_str: str) -> dict[str, Any]:
     # Count comments
     result["comment_count"] = len(re.findall(r"<comment[^>]*>", xml_str))
 
+    m = re.search(
+        r'<project name="([^"]*)"[^>]*>([^<]*)</project>', xml_str,
+    )
+    if m:
+        result["project_name"] = m.group(1).strip()
+        result["project_summary"] = m.group(2).strip()
+    else:
+        m = re.search(r'<project name="([^"]*)"', xml_str)
+        if m:
+            result["project_name"] = m.group(1).strip()
+
     return result
+
+
+def _truncate_context(text: str, limit: int = PROJECT_CONTEXT_MAX_LEN) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…(truncated)"
+
+
+def format_project_context_block(
+    issue_project: dict[str, Any] | None,
+    *,
+    fallback_name: str = "",
+    fallback_summary: str = "",
+) -> str:
+    """Format Linear project fields for prompt injection."""
+    project = issue_project or {}
+    name = (project.get("name") or fallback_name or "").strip()
+    summary = (project.get("description") or fallback_summary or "").strip()
+    content = (project.get("content") or "").strip()
+
+    if not name and not summary and not content:
+        return ""
+
+    lines = [f"Project: {name or '(unnamed)'}"]
+
+    status = project.get("status") or {}
+    status_name = (status.get("name") or "").strip()
+    status_type = (status.get("type") or "").strip()
+    if status_name or status_type:
+        if status_name and status_type:
+            lines.append(f"Project status: {status_name} ({status_type})")
+        else:
+            lines.append(f"Project status: {status_name or status_type}")
+
+    url = (project.get("url") or "").strip()
+    if url:
+        lines.append(f"Project URL: {url}")
+
+    if summary:
+        lines.append(f"Project summary: {summary}")
+
+    if content:
+        lines.append(f"Project overview:\n{_truncate_context(content)}")
+
+    return "\n".join(lines) + "\n"
+
+
+def format_guidance_block(guidance: list[str]) -> str:
+    rules = [g.strip() for g in guidance if g and g.strip()]
+    if not rules:
+        return ""
+    return (
+        "Team/workspace guidance:\n"
+        + "\n".join(f"- {rule}" for rule in rules)
+        + "\n"
+    )
+
+
+def format_project_issues_block(issues: list[dict[str, Any]]) -> str:
+    if not issues:
+        return ""
+    lines = [
+        "Recent issues in this project (shared context):",
+    ]
+    for iss in issues[:PROJECT_SIBLING_ISSUES_MAX]:
+        ident = iss.get("identifier", "")
+        title = (iss.get("title") or "").strip()
+        state = (iss.get("state") or {}).get("name", "")
+        desc = (iss.get("description") or "").replace("\n", " ").strip()
+        if len(desc) > PROJECT_SIBLING_DESC_MAX:
+            desc = desc[:PROJECT_SIBLING_DESC_MAX] + "…"
+        state_part = f" [{state}]" if state else ""
+        detail = f": {desc}" if desc else ""
+        lines.append(f"- {ident}{state_part} {title}{detail}")
+    return "\n".join(lines) + "\n"
+
+
+def map_hermes_todo_status_to_linear(status: str) -> str:
+    normalized = (status or "").strip().lower().replace("-", "_")
+    return {
+        "pending": _PLAN_PENDING,
+        "in_progress": _PLAN_ACTIVE,
+        "completed": _PLAN_DONE,
+        "cancelled": "canceled",
+        "canceled": "canceled",
+    }.get(normalized, _PLAN_PENDING)
+
+
+def hermes_todos_to_linear_plan_steps(
+    todos: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Map Hermes todo items to Linear Agent Plan step dicts."""
+    steps: list[dict[str, str]] = []
+    for item in todos[:PLAN_MAX_STEPS]:
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > PLAN_STEP_MAX_LEN:
+            content = content[: PLAN_STEP_MAX_LEN - 1] + "…"
+        steps.append({
+            "content": content,
+            "status": map_hermes_todo_status_to_linear(
+                str(item.get("status", "")),
+            ),
+        })
+    return steps
 
 
 def _format_activities_conversation(activities: list[dict[str, Any]]) -> str:
@@ -1321,6 +1544,12 @@ class SessionPlanTracker:
             await self.linear.update_plan(self.session_id, self.steps)
         except Exception:
             log.warning("Session plan update failed", exc_info=True)
+
+    async def sync_from_hermes_todos(self, todos: list[dict[str, Any]]) -> None:
+        """Project Hermes native todos onto the Linear plan checklist."""
+        self.steps = hermes_todos_to_linear_plan_steps(todos)
+        if self.steps:
+            await self._sync()
 
 
 def _parse_hermes_plan_json(text: str) -> list[str]:
@@ -2151,6 +2380,96 @@ class TaskProcessor:
                 f" capabilities."
             )
 
+    def build_native_turn_message(
+        self,
+        session: AgentSession,
+        issue: dict[str, Any],
+        user_request: str,
+        *,
+        conversation_text: str = "",
+        project_issues_block: str = "",
+        include_full_context: bool = True,
+    ) -> str:
+        """Minimal turn payload for Hermes-native mode (one session per assignment)."""
+        identifier = issue.get("identifier", session.issue_identifier)
+        title = issue.get("title", session.title)
+        state = issue.get("state", {})
+        labels = [l["name"] for l in
+                  (issue.get("labels", {}).get("nodes", []) or [])]
+        team = issue.get("team") or {}
+        team_name = team.get("name", "")
+        team_key = team.get("key", "")
+
+        if include_full_context:
+            description = issue.get("description", session.description) or ""
+            project_block = format_project_context_block(
+                issue.get("project") or {},
+                fallback_name=session.project_name,
+                fallback_summary=session.project_summary,
+            )
+            guidance_block = format_guidance_block(session.guidance)
+            parts = [
+                f"Linear assignment: {identifier} — {title}",
+                f"Status: {state.get('name', 'Unknown')}",
+                f"Team: {team_name}{f' ({team_key})' if team_key else ''}",
+                f"Labels: {', '.join(labels) or 'none'}",
+            ]
+            if project_block:
+                parts.append(project_block.rstrip())
+            if project_issues_block:
+                parts.append(project_issues_block.rstrip())
+            if guidance_block:
+                parts.append(guidance_block.rstrip())
+            if description:
+                parts.append(f"Issue description:\n{description}")
+            if conversation_text.strip():
+                parts.append(conversation_text.strip())
+            parts.extend([
+                f"User request:\n{user_request}",
+                HERMES_NATIVE_TODO_HINT,
+                (
+                    "Confirm target hosts (VPS, staging, prod) from project "
+                    "overview, comments, or sibling issues before SSH, PAM, "
+                    "firewall, or package changes."
+                ),
+                (
+                    "LINEAR_API_KEY is available as $LINEAR_API_KEY for "
+                    "GraphQL calls to api.linear.app if needed."
+                ),
+                LINEAR_OUTPUT_RULES,
+                (
+                    "Investigate with your tools. Tool progress appears on "
+                    "the Linear timeline; a follow-up pass may rewrite your "
+                    "final reply for the user."
+                ),
+            ])
+            return "\n\n".join(parts)
+
+        # Follow-up turn — delta only; Hermes session retains prior work.
+        parts = [
+            f"Follow-up on {identifier} — {title}",
+            f"Status: {state.get('name', 'Unknown')}",
+            f"User message:\n{user_request}",
+        ]
+        if conversation_text.strip():
+            parts.append(conversation_text.strip())
+        parts.append(LINEAR_OUTPUT_RULES)
+        return "\n\n".join(parts)
+
+    async def _sync_plan_from_hermes_todos(
+        self,
+        plan: SessionPlanTracker,
+        hermes_session_id: str,
+    ) -> None:
+        """Refresh Linear plan checklist from Hermes native todos."""
+        todos = await self.linear.fetch_hermes_todos(hermes_session_id)
+        await plan.sync_from_hermes_todos(todos)
+        if todos:
+            log.info(
+                "Synced %d Hermes todo(s) to Linear plan for session %s",
+                len(todos), hermes_session_id[:8],
+            )
+
     async def _fetch_hermes_skills_context(self) -> str:
         """List Hermes skills from the API server for prompt injection."""
         if not settings.hermes_api_key:
@@ -2518,32 +2837,51 @@ class TaskProcessor:
         # The user's actual request (from the comment that triggered this)
         user_request = session.body or description or f"Respond to issue {identifier}"
 
-        skills_context = await self._fetch_hermes_skills_context()
-
         plan = SessionPlanTracker(session_id=session_id, linear=self.linear)
-        hermes_steps = await self._call_llm_plan(
-            identifier=identifier,
-            title=title,
-            user_request=user_request,
-            description=description,
-            session_id=session_id,
-            skills_context=skills_context,
-        )
-        if hermes_steps:
-            await plan.set_from_hermes(hermes_steps)
-        else:
-            await plan.start_fallback(identifier)
 
-        prompt = self.build_llm_prompt(
-            session, issue, conversation_text, user_request, internal_text,
-            skills_context=skills_context,
-            plan_steps=hermes_steps or [s["content"] for s in plan.steps],
-        )
+        if settings.hermes_native_mode:
+            project_issues_block = ""
+            project_id = (issue.get("project") or {}).get("id")
+            if project_id:
+                siblings = await self.linear.get_project_issue_summaries(
+                    project_id, exclude_issue_id=issue.get("id", ""),
+                )
+                project_issues_block = format_project_issues_block(siblings)
+
+            prompt = self.build_native_turn_message(
+                session,
+                issue,
+                user_request,
+                conversation_text=conversation_text,
+                project_issues_block=project_issues_block,
+                include_full_context=(session.action != SessionAction.prompted),
+            )
+            log.info("Hermes native mode: session=%s action=%s",
+                     session_id[:8], session.action.value)
+        else:
+            skills_context = await self._fetch_hermes_skills_context()
+            hermes_steps = await self._call_llm_plan(
+                identifier=identifier,
+                title=title,
+                user_request=user_request,
+                description=description,
+                session_id=session_id,
+                skills_context=skills_context,
+            )
+            if hermes_steps:
+                await plan.set_from_hermes(hermes_steps)
+            else:
+                await plan.start_fallback(identifier)
+
+            prompt = self.build_llm_prompt(
+                session, issue, conversation_text, user_request, internal_text,
+                skills_context=skills_context,
+                plan_steps=hermes_steps or [s["content"] for s in plan.steps],
+            )
 
         # Initialize DiscoveryTracker for result-oriented progress updates
         tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
-        # Set initial context — cursor-style: "Examining issue PLY-41"
-        await tracker.in_progress(f"Examining issue {identifier}")
+        await tracker.in_progress(f"Working on {identifier}")
 
         # Start background keepalive to continue sending activity during long LLM calls
         keepalive_task = asyncio.create_task(
@@ -2595,6 +2933,8 @@ class TaskProcessor:
                 response_text, pr_urls,
             )
 
+            if settings.hermes_native_mode:
+                await self._sync_plan_from_hermes_todos(plan, session_id)
             await plan.finish()
             await self.linear.send_response(session_id, response_text)
             # Task complete — move to "In Review" for the user
@@ -2722,8 +3062,18 @@ class TaskProcessor:
                                     tracker._skip_texts.add(discovery)
                                     tracker.tool_progress.append(discovery)
                                     await progress_worker.put(discovery)
-                                    if plan:
+                                    if plan and not settings.hermes_native_mode:
                                         await plan.advance()
+                                    if (
+                                        plan
+                                        and settings.hermes_native_mode
+                                        and progress_data.get("tool") == "todo"
+                                        and (progress_data.get("status") or "").lower()
+                                        in ("completed", "running")
+                                    ):
+                                        await self._sync_plan_from_hermes_todos(
+                                            plan, session_id,
+                                        )
                                     log.info(
                                         "Hermes tool progress: %s",
                                         discovery[:80],
@@ -2859,7 +3209,10 @@ class TaskProcessor:
             "Content-Type": "application/json",
         }
         if session_id:
-            headers["X-Hermes-Session-Id"] = f"{session_id}:finalize"
+            if settings.hermes_native_mode:
+                headers["X-Hermes-Session-Id"] = session_id
+            else:
+                headers["X-Hermes-Session-Id"] = f"{session_id}:finalize"
 
         try:
             async with httpx.AsyncClient(timeout=180.0) as client:
@@ -3147,6 +3500,8 @@ class AgentWebhookHandler:
             state_type=issue_data.get("state", {}).get("type", ""),
             comments=previous_comments,
             guidance=parsed_context.get("guidance", []),
+            project_name=parsed_context.get("project_name", ""),
+            project_summary=parsed_context.get("project_summary", ""),
         )
 
         # ── Team allowlist check ──
