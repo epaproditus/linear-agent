@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import socket
 import textwrap
 import time
 from collections import deque
@@ -72,6 +73,14 @@ PORT = 8660
 
 HERMES_WORK_STYLE = """
 Work style:
+- Context before action: read the project overview, issue description, full
+  comment thread, sibling project issues, and workspace guidance in this prompt
+  before running shell commands, installing packages, or changing system config
+  (SSH, PAM, firewall, users, services). Identify the target host (VPS, agent
+  host, or other), environment, and paths from that text — do not guess.
+- Execution target: shell and filesystem tools run on the agent host named in
+  this prompt unless you explicitly SSH elsewhere. Remote work requires evidence
+  in the thread (hostname, IP, SSH alias) and an explicit ssh command.
 - Run tools and shell commands yourself — never ask the user to run commands.
 - Use the full issue thread and prior comments as context; do not ignore earlier turns.
 - When a Hermes skill matches the task, read and follow it completely before improvising.
@@ -104,6 +113,9 @@ PLAN_STEP_MAX_LEN = 48
 PLAN_MAX_STEPS = 5
 PLAN_STEP_MAX_WORDS = 6
 PROJECT_CONTEXT_MAX_LEN = 4000
+PROJECT_SIBLING_ISSUES_MAX = 8
+PROJECT_SIBLING_DESC_MAX = 200
+CONVERSATION_SUMMARY_MAX = 1500
 
 # Map embedded shell/git commands to short checklist labels.
 _PLAN_COMMAND_LABELS: list[tuple[re.Pattern[str], str]] = [
@@ -259,6 +271,25 @@ query Issue($id: String!) {
           }
         }
       }
+    }
+  }
+}
+"""
+
+GQL_PROJECT_ISSUES = """
+query ProjectIssues($projectId: ID!, $first: Int!) {
+  issues(
+    filter: { project: { id: { eq: $projectId } } }
+    first: $first
+    orderBy: updatedAt
+  ) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      updatedAt
+      state { name }
     }
   }
 }
@@ -515,6 +546,33 @@ class LinearClient:
             return data.get("issue")
         except RuntimeError:
             return None
+
+    async def get_project_issue_summaries(
+        self,
+        project_id: str,
+        exclude_issue_id: str = "",
+        limit: int = PROJECT_SIBLING_ISSUES_MAX,
+    ) -> list[dict[str, Any]]:
+        """Recent issues in the same project (for cross-issue context)."""
+        if not project_id:
+            return []
+        try:
+            data = await self._gql(
+                GQL_PROJECT_ISSUES,
+                {"projectId": project_id, "first": limit + 4},
+            )
+            nodes = data.get("issues", {}).get("nodes", []) or []
+            out: list[dict[str, Any]] = []
+            for node in nodes:
+                if exclude_issue_id and node.get("id") == exclude_issue_id:
+                    continue
+                out.append(node)
+                if len(out) >= limit:
+                    break
+            return out
+        except RuntimeError:
+            log.debug("Could not fetch project issues for %s", project_id[:8])
+            return []
 
     async def comment(self, issue_id: str, body: str, parent_id: str | None = None) -> bool:
         """Add a comment to an issue, optionally as a threaded reply."""
@@ -1128,6 +1186,50 @@ def format_guidance_block(guidance: list[str]) -> str:
     )
 
 
+def format_execution_environment_block() -> str:
+    """Tell the LLM where shell/filesystem tools actually run."""
+    host = socket.gethostname()
+    workdir = settings.coding_workdir
+    return (
+        "Execution environment (where shell/filesystem tools run by default):\n"
+        f"- Agent host: {host}\n"
+        f"- Default working directory: {workdir}\n"
+        "- Commands affect this host unless you explicitly SSH to another.\n"
+        "- Confirm the intended target (VPS, staging, prod) from project "
+        "overview, comments, or sibling issues before system changes.\n"
+    )
+
+
+def format_project_issues_block(issues: list[dict[str, Any]]) -> str:
+    """Summarize recent sibling issues in the same Linear project."""
+    if not issues:
+        return ""
+    lines = [
+        "Recent issues in this project (shared context — review before acting):",
+    ]
+    for iss in issues[:PROJECT_SIBLING_ISSUES_MAX]:
+        ident = iss.get("identifier", "")
+        title = (iss.get("title") or "").strip()
+        state = (iss.get("state") or {}).get("name", "")
+        desc = (iss.get("description") or "").replace("\n", " ").strip()
+        if len(desc) > PROJECT_SIBLING_DESC_MAX:
+            desc = desc[:PROJECT_SIBLING_DESC_MAX] + "…"
+        state_part = f" [{state}]" if state else ""
+        detail = f": {desc}" if desc else ""
+        lines.append(f"- {ident}{state_part} {title}{detail}")
+    return "\n".join(lines) + "\n"
+
+
+def summarize_conversation_text(conversation_text: str, limit: int = CONVERSATION_SUMMARY_MAX) -> str:
+    """Truncate conversation block for planning prompts."""
+    text = (conversation_text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…(conversation truncated for planning)"
+
+
 def _format_activities_conversation(activities: list[dict[str, Any]]) -> str:
     """Reconstruct a structured conversation from session activities.
 
@@ -1357,9 +1459,10 @@ class SessionPlanTracker:
     async def start_fallback(self, identifier: str) -> None:
         """Generic plan when Hermes planning call fails."""
         self.steps = [
-            {"content": f"Examine {identifier}", "status": _PLAN_DONE},
-            {"content": "Investigate with tools", "status": _PLAN_ACTIVE},
-            {"content": "Deliver final answer", "status": _PLAN_PENDING},
+            {"content": "Review project context", "status": _PLAN_ACTIVE},
+            {"content": "Read issue thread", "status": _PLAN_PENDING},
+            {"content": "Confirm target host", "status": _PLAN_PENDING},
+            {"content": "Investigate with tools", "status": _PLAN_PENDING},
         ]
         await self._sync()
 
@@ -2118,18 +2221,22 @@ class TaskProcessor:
         internal_text: str = "",
         skills_context: str = "",
         plan_steps: list[str] | None = None,
+        project_issues_block: str = "",
     ) -> str:
         """Assemble the full LLM prompt from session + issue context.
 
         The prompt consists of:
         1. System declaration ("You are Hermes...")
-        2. LINEAR_API_KEY usage (referenced as env var, never interpolated directly)
-        3. Issue context: identifier, title, status, project (name, status, url,
+        2. Execution environment (agent host, default cwd)
+        3. LINEAR_API_KEY usage (referenced as env var, never interpolated directly)
+        4. Issue context: identifier, title, status, project (name, status, url,
            summary, overview), team, labels, description, workspace guidance
-        4. Conversation thread (all comments, chronological, full body — deterministic)
-        5. Prior session activity (tool calls, thoughts — prompted sessions only)
-        6. User's message (session.body or description fallback)
-        7. Instruction: "Do what needs to be done"
+        5. Sibling project issues (recent titles/descriptions in same project)
+        6. Conversation thread (all comments, chronological, full body)
+        7. Prior session activity (tool calls, thoughts — prompted sessions only)
+        8. Session plan checklist
+        9. User's message (session.body or description fallback)
+        10. Instruction: context-first work style, then act
 
         See PLY-32 for the full spec.
         """
@@ -2146,6 +2253,7 @@ class TaskProcessor:
             fallback_summary=session.project_summary,
         )
         guidance_block = format_guidance_block(session.guidance)
+        execution_block = format_execution_environment_block()
         team = issue.get("team") or {}
         team_name = team.get("name", "")
         team_key = team.get("key", "")
@@ -2160,10 +2268,20 @@ class TaskProcessor:
         plan_block = ""
         if plan_steps:
             plan_block = (
-                "\nYour plan for this issue (follow in order):\n"
+                "\nYour plan for this issue (follow in order — complete context "
+                "review steps before shell or system changes):\n"
                 + "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan_steps))
                 + "\n"
             )
+
+        context_sections = (
+            f"{execution_block}\n"
+            f"{project_block}"
+            f"{project_issues_block}"
+            f"{guidance_block}"
+            f"{conversation_text}\n"
+            f"{internal_text}\n"
+        )
 
         if session.action == SessionAction.prompted:
             # Follow-up turn — continue the work/conversation in this thread
@@ -2179,15 +2297,14 @@ class TaskProcessor:
                 f" tools if you need it.\n"
                 f"\n"
                 f"Issue: {identifier} — {title}\n"
-                f"{project_block}"
                 f"Team: {team_name}"
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
-                f"{guidance_block}"
+                f"\n"
+                f"Read all context below before acting on the user message.\n"
+                f"{context_sections}"
                 f"{skills_block}"
                 f"{plan_block}"
-                f"{internal_text}\n"
-                f"{conversation_text}\n"
                 f"User: {user_request}\n"
                 f"\n"
                 f"Investigate with your tools, then produce a thorough internal"
@@ -2215,17 +2332,15 @@ class TaskProcessor:
                 f"\n"
                 f"Issue: {identifier} — {title}"
                 f" | Status: {state.get('name', 'Unknown')}\n"
-                f"{project_block}"
                 f"Team: {team_name}"
                 f"{f' ({team_key})' if team_key else ''}\n"
                 f"Labels: {', '.join(labels) or 'none'}\n"
                 f"Description: {description or '(no description)'}\n"
-                f"{guidance_block}"
+                f"\n"
+                f"Read all context below before acting on the user message.\n"
+                f"{context_sections}"
                 f"{skills_block}"
                 f"{plan_block}"
-                f"{internal_text}\n"
-                f"{conversation_text}\n"
-                f"\n"
                 f"User: {user_request}\n"
                 f"\n"
                 f"Investigate with your tools, then produce a thorough internal"
@@ -2277,27 +2392,40 @@ class TaskProcessor:
         user_request: str,
         description: str,
         skills_context: str = "",
+        project_block: str = "",
+        conversation_summary: str = "",
     ) -> str:
         skills_block = ""
         if skills_context:
             skills_block = f"\nAvailable skills:\n{skills_context}\n"
         desc = (description or "")[:800]
+        project_section = f"\n{project_block}" if project_block.strip() else ""
+        conversation_section = ""
+        if conversation_summary.strip():
+            conversation_section = (
+                f"\nIssue conversation (excerpt):\n{conversation_summary}\n"
+            )
         return (
             "You are Hermes, planning how to handle a Linear issue.\n"
             "Do not use tools. Output a JSON plan only.\n"
             "\n"
             f"Issue: {identifier} — {title}\n"
             f"Description: {desc or '(none)'}\n"
+            f"{project_section}"
+            f"{conversation_section}"
             f"{skills_block}"
             f"User request:\n{user_request}\n"
             "\n"
             "Return 3–5 terse checklist steps for this issue.\n"
+            "The FIRST steps must establish context before any system or shell "
+            "work — e.g. 'Review project context', 'Read issue thread', "
+            "'Confirm target host'.\n"
             "Each step: max 6 words, imperative, intent only — not how.\n"
-            "Labels like 'Check git status', 'Review recent commits',"
-            " 'Diff changed files', 'Read linear_agent.py'.\n"
+            "Labels like 'Review project context', 'Confirm target host',"
+            " 'Check git status', 'Read linear_agent.py'.\n"
             "Never include shell commands, flags, paths, tildes, or quoted strings.\n"
             "Bad: \"Navigate to ~/repo and run 'git status'\".\n"
-            "Good: \"Check git status\".\n"
+            "Good: \"Confirm target host\".\n"
             "No explanations, sub-clauses, or 'in order to' phrasing.\n"
             "Do not include 'write final answer' — that is implicit.\n"
             "\n"
@@ -2312,13 +2440,21 @@ class TaskProcessor:
         description: str,
         session_id: str = "",
         skills_context: str = "",
+        project_block: str = "",
+        conversation_summary: str = "",
     ) -> list[str]:
         """Ask Hermes for issue-specific plan steps before investigation."""
         if not settings.hermes_api_key:
             return []
 
         prompt = self._build_plan_prompt(
-            identifier, title, user_request, description, skills_context,
+            identifier,
+            title,
+            user_request,
+            description,
+            skills_context,
+            project_block=project_block,
+            conversation_summary=conversation_summary,
         )
         headers = {
             "Authorization": f"Bearer {settings.hermes_api_key}",
@@ -2608,6 +2744,21 @@ class TaskProcessor:
         # The user's actual request (from the comment that triggered this)
         user_request = session.body or description or f"Respond to issue {identifier}"
 
+        project = issue.get("project") or {}
+        project_block = format_project_context_block(
+            project,
+            fallback_name=session.project_name,
+            fallback_summary=session.project_summary,
+        )
+
+        project_issues_block = ""
+        project_id = project.get("id")
+        if project_id:
+            siblings = await self.linear.get_project_issue_summaries(
+                project_id, exclude_issue_id=issue.get("id", ""),
+            )
+            project_issues_block = format_project_issues_block(siblings)
+
         skills_context = await self._fetch_hermes_skills_context()
 
         plan = SessionPlanTracker(session_id=session_id, linear=self.linear)
@@ -2618,6 +2769,8 @@ class TaskProcessor:
             description=description,
             session_id=session_id,
             skills_context=skills_context,
+            project_block=project_block,
+            conversation_summary=summarize_conversation_text(conversation_text),
         )
         if hermes_steps:
             await plan.set_from_hermes(hermes_steps)
@@ -2628,12 +2781,12 @@ class TaskProcessor:
             session, issue, conversation_text, user_request, internal_text,
             skills_context=skills_context,
             plan_steps=hermes_steps or [s["content"] for s in plan.steps],
+            project_issues_block=project_issues_block,
         )
 
         # Initialize DiscoveryTracker for result-oriented progress updates
         tracker = DiscoveryTracker(session_id=session_id, linear=self.linear)
-        # Set initial context — cursor-style: "Examining issue PLY-41"
-        await tracker.in_progress(f"Examining issue {identifier}")
+        await tracker.in_progress(f"Reviewing context for {identifier}")
 
         # Start background keepalive to continue sending activity during long LLM calls
         keepalive_task = asyncio.create_task(

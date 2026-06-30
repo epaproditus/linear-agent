@@ -11,9 +11,12 @@ from linear_agent import (
     PROJECT_CONTEXT_MAX_LEN,
     SessionAction,
     TaskProcessor,
+    format_execution_environment_block,
     format_guidance_block,
     format_project_context_block,
+    format_project_issues_block,
     parse_prompt_context,
+    summarize_conversation_text,
 )
 
 
@@ -133,17 +136,35 @@ def test_build_llm_prompt_includes_rich_project_and_guidance(
         },
     }
 
+    sibling_block = format_project_issues_block([
+        {
+            "identifier": "PLY-40",
+            "title": "Harden VPS SSH PAM",
+            "state": {"name": "Done"},
+            "description": "Work on vps.example.com — not local machine.",
+        },
+    ])
+
     prompt = processor.build_llm_prompt(
         sample_session,
         issue,
-        conversation_text="",
+        conversation_text="\n\nFull conversation:\n- User: use the VPS\n",
         user_request="Please investigate",
+        project_issues_block=sibling_block,
     )
 
     assert "Project: Hermes as Linear agent" in prompt
     assert "Linear webhook -> Hermes API" in prompt
     assert "Always follow coding standards" in prompt
     assert "Team/workspace guidance:" in prompt
+    assert "Execution environment" in prompt
+    assert "Agent host:" in prompt
+    assert "Read all context below before acting" in prompt
+    assert "PLY-40" in prompt
+    assert "vps.example.com" in prompt
+    assert "Context before action" in prompt
+    # Context must appear before the user request
+    assert prompt.index("Full conversation") < prompt.index("User: Please investigate")
 
 
 def test_build_llm_prompt_omits_raw_prompt_context_xml(
@@ -179,3 +200,45 @@ def test_gql_issue_by_id_project_fields() -> None:
     fields = match.group(1)
     for field in ("id", "name", "description", "content", "url", "status"):
         assert field in fields
+
+
+def test_format_execution_environment_block() -> None:
+    block = format_execution_environment_block()
+    assert "Execution environment" in block
+    assert "Agent host:" in block
+    assert "explicitly SSH" in block
+
+
+def test_format_project_issues_block() -> None:
+    block = format_project_issues_block([
+        {
+            "identifier": "INFRA-12",
+            "title": "VPS baseline",
+            "state": {"name": "Done"},
+            "description": "Target: vps.prod.example.com",
+        },
+    ])
+    assert "INFRA-12" in block
+    assert "vps.prod.example.com" in block
+
+
+def test_summarize_conversation_text_truncates() -> None:
+    long_text = "x" * 5000
+    summary = summarize_conversation_text(long_text, limit=100)
+    assert len(summary) < 200
+    assert "truncated" in summary
+
+
+def test_build_plan_prompt_requires_context_first_steps() -> None:
+    processor = TaskProcessor(linear=_StubLinear())  # type: ignore[arg-type]
+    prompt = processor._build_plan_prompt(
+        "PLY-99",
+        "Harden PAM",
+        "Lock down SSH PAM on the server",
+        "Security hardening task",
+        project_block="Project: Infra\n",
+        conversation_summary="- User: work on the VPS\n",
+    )
+    assert "Review project context" in prompt or "Confirm target host" in prompt
+    assert "Project: Infra" in prompt
+    assert "VPS" in prompt
