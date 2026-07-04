@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import time
 from collections import deque
@@ -1083,26 +1084,76 @@ def format_guidance_block(guidance: list[str]) -> str:
 
 
 
-def format_task_workspace_block(issue_key: str) -> str:
+def _safe_issue_workspace_key(issue_key: str) -> str:
+    """Sanitize a Linear issue identifier for use as a directory name."""
+    key = (issue_key or "").strip()
+    if not key or not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        raise ValueError(f"Invalid issue key for workspace: {issue_key!r}")
+    return key
+
+
+def task_workspace_dir(issue_key: str) -> Path:
+    """Return the ephemeral scratch directory path for an issue."""
+    return Path(settings.agent_workdir) / _safe_issue_workspace_key(issue_key)
+
+
+def ensure_task_workspace(issue_key: str) -> Path:
+    """Create the per-issue scratch directory if missing (idempotent)."""
+    path = task_workspace_dir(issue_key)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def cleanup_task_workspace(issue_key: str) -> bool:
+    """Remove the per-issue scratch directory. Returns True if a dir was removed."""
+    try:
+        path = task_workspace_dir(issue_key)
+    except ValueError:
+        log.warning("Skipping task workspace cleanup for invalid key: %r", issue_key)
+        return False
+
+    if not path.exists():
+        return False
+
+    base = Path(settings.agent_workdir).resolve()
+    resolved = path.resolve()
+    if resolved != base and base not in resolved.parents:
+        log.warning("Refusing to remove task workspace outside base: %s", resolved)
+        return False
+
+    shutil.rmtree(resolved)
+    log.info("Removed task workspace %s", resolved)
+    return True
+
+
+def format_task_workspace_block(issue_key: str, *, ready: bool = False) -> str:
     """Per-issue scratch directory instructions for isolated repo work."""
     if not issue_key:
         return ""
-    workdir = settings.agent_workdir
-    task_dir = f"{workdir}/{issue_key}"
-    return (
-        "Task workspace (isolated scratch area for this issue):\n"
-        f"- Work inside `{task_dir}/` — clone repos and run commands there, "
+    try:
+        task_dir = task_workspace_dir(issue_key)
+    except ValueError:
+        return ""
+    ready_line = (
+        f"- Directory `{task_dir}/` is ready — clone repos and run commands here only.\n"
+        if ready
+        else f"- Work inside `{task_dir}/` — clone repos and run commands there, "
         "not elsewhere on the host filesystem.\n"
-        f"- Create it if needed: `mkdir -p {task_dir}`\n"
-        f"- When the issue is resolved, remove it: `rm -rf {task_dir}`\n"
+    )
+    return (
+        "Task workspace (ephemeral scratch area for this issue):\n"
+        f"{ready_line}"
+        "- The linear-agent adapter creates this directory when work starts and "
+        "removes it when the issue is Done or Canceled.\n"
+        "- Do not delete this directory yourself.\n"
     )
 
 
-def format_execution_environment_block(issue_key: str = "") -> str:
+def format_execution_environment_block(issue_key: str = "", *, workspace_ready: bool = False) -> str:
     """Tell the LLM where shell/filesystem tools actually run."""
     host = socket.gethostname()
     workdir = settings.agent_workdir
-    task_block = format_task_workspace_block(issue_key)
+    task_block = format_task_workspace_block(issue_key, ready=workspace_ready)
     return (
         "Execution environment (where shell/filesystem tools run by default):\n"
         f"- Agent host: {host}\n"
@@ -2537,6 +2588,7 @@ class TaskProcessor:
         project_issues_block: str = "",
         gate_mode: bool = False,
         relations_block: str = "",
+        workspace_ready: bool = False,
     ) -> str:
         """Assemble the full LLM prompt from session + issue context.
 
@@ -2569,7 +2621,9 @@ class TaskProcessor:
             fallback_summary=session.project_summary,
         )
         guidance_block = format_guidance_block(session.guidance)
-        execution_block = format_execution_environment_block(identifier)
+        execution_block = format_execution_environment_block(
+            identifier, workspace_ready=workspace_ready,
+        )
         team = issue.get("team") or {}
         team_name = team.get("name", "")
         team_key = team.get("key", "")
@@ -2687,6 +2741,7 @@ class TaskProcessor:
         relations_block: str = "",
         include_full_context: bool = True,
         gate_mode: bool = False,
+        workspace_ready: bool = False,
     ) -> str:
         """Minimal turn payload for Hermes-native mode (one session per assignment)."""
         identifier = issue.get("identifier", session.issue_identifier)
@@ -2706,7 +2761,9 @@ class TaskProcessor:
                 fallback_summary=session.project_summary,
             )
             guidance_block = format_guidance_block(session.guidance)
-            task_workspace_block = format_task_workspace_block(identifier)
+            task_workspace_block = format_task_workspace_block(
+                identifier, ready=workspace_ready,
+            )
             parts = [
                 f"Linear assignment: {identifier} — {title}",
                 f"Status: {state.get('name', 'Unknown')}",
@@ -2949,6 +3006,14 @@ class TaskProcessor:
         description = issue.get("description", session.description) or ""
         title = issue.get("title", session.title) or ""
 
+        workspace_ready = False
+        try:
+            ensure_task_workspace(identifier)
+            workspace_ready = True
+            log.info("Task workspace ready: %s", task_workspace_dir(identifier))
+        except ValueError:
+            log.warning("Skipping task workspace for invalid identifier: %s", identifier)
+
         raw_nodes = issue.get("comments", {}).get("nodes", []) or []
         flat = dedupe_threaded_comments(_flatten_comments(raw_nodes))
         watermark_out = encode_conversation_watermark(flat)
@@ -3003,6 +3068,7 @@ class TaskProcessor:
                 relations_block=relations_block,
                 include_full_context=(session.action != SessionAction.prompted),
                 gate_mode=gate_mode,
+                workspace_ready=workspace_ready,
             )
             log.info(
                 "Hermes native mode: session=%s action=%s gate=%s",
@@ -3048,6 +3114,7 @@ class TaskProcessor:
                 project_issues_block=project_issues_block,
                 gate_mode=gate_mode,
                 relations_block=relations_block,
+                workspace_ready=workspace_ready,
             )
 
         # Initialize DiscoveryTracker for result-oriented progress updates
@@ -3821,7 +3888,10 @@ class AgentWebhookHandler:
 
         # Skip terminal states — don't re-process completed/canceled issues
         state_type = payload.get("state", {}).get("type", "") or payload.get("issue", {}).get("state", {}).get("type", "")
+        identifier = payload.get("identifier", "") or payload.get("issue", {}).get("identifier", "")
         if state_type in ("completed", "canceled"):
+            if identifier:
+                cleanup_task_workspace(identifier)
             return f"skipped ({state_type} issue)"
 
         log.info("Issue %s assigned to agent", issue_id)

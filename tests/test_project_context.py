@@ -204,13 +204,13 @@ def test_gql_issue_by_id_project_fields() -> None:
 
 
 def test_format_execution_environment_block() -> None:
-    block = format_execution_environment_block("PLY-150")
+    block = format_execution_environment_block("PLY-150", workspace_ready=True)
     assert "Execution environment" in block
     assert "Agent host:" in block
     assert "explicitly SSH" in block
     assert "Task workspace" in block
     assert "PLY-150" in block
-    assert "rm -rf" in block
+    assert "is ready" in block
 
 
 def test_format_task_workspace_block_empty() -> None:
