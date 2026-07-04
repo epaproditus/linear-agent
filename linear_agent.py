@@ -1083,14 +1083,31 @@ def format_guidance_block(guidance: list[str]) -> str:
 
 
 
-def format_execution_environment_block() -> str:
+def format_task_workspace_block(issue_key: str) -> str:
+    """Per-issue scratch directory instructions for isolated repo work."""
+    if not issue_key:
+        return ""
+    workdir = settings.agent_workdir
+    task_dir = f"{workdir}/{issue_key}"
+    return (
+        "Task workspace (isolated scratch area for this issue):\n"
+        f"- Work inside `{task_dir}/` — clone repos and run commands there, "
+        "not elsewhere on the host filesystem.\n"
+        f"- Create it if needed: `mkdir -p {task_dir}`\n"
+        f"- When the issue is resolved, remove it: `rm -rf {task_dir}`\n"
+    )
+
+
+def format_execution_environment_block(issue_key: str = "") -> str:
     """Tell the LLM where shell/filesystem tools actually run."""
     host = socket.gethostname()
     workdir = settings.agent_workdir
+    task_block = format_task_workspace_block(issue_key)
     return (
         "Execution environment (where shell/filesystem tools run by default):\n"
         f"- Agent host: {host}\n"
         f"- Default working directory: {workdir}\n"
+        f"{task_block}"
         "- Commands affect this host unless you explicitly SSH to another.\n"
         "- Confirm the intended target (VPS, staging, prod) from project "
         "overview, comments, or sibling issues before system changes.\n"
@@ -2552,7 +2569,7 @@ class TaskProcessor:
             fallback_summary=session.project_summary,
         )
         guidance_block = format_guidance_block(session.guidance)
-        execution_block = format_execution_environment_block()
+        execution_block = format_execution_environment_block(identifier)
         team = issue.get("team") or {}
         team_name = team.get("name", "")
         team_key = team.get("key", "")
@@ -2689,6 +2706,7 @@ class TaskProcessor:
                 fallback_summary=session.project_summary,
             )
             guidance_block = format_guidance_block(session.guidance)
+            task_workspace_block = format_task_workspace_block(identifier)
             parts = [
                 f"Linear assignment: {identifier} — {title}",
                 f"Status: {state.get('name', 'Unknown')}",
@@ -2703,6 +2721,8 @@ class TaskProcessor:
                 parts.append(relations_block.rstrip())
             if guidance_block:
                 parts.append(guidance_block.rstrip())
+            if task_workspace_block:
+                parts.append(task_workspace_block.rstrip())
             if description:
                 parts.append(f"Issue description:\n{description}")
             if conversation_text.strip():

@@ -13,8 +13,9 @@ from linear_agent import (
     TaskProcessor,
     format_execution_environment_block,
     format_guidance_block,
-    format_project_context_block,
     format_project_issues_block,
+    format_project_context_block,
+    format_task_workspace_block,
     parse_prompt_context,
     summarize_conversation_text,
 )
@@ -203,10 +204,17 @@ def test_gql_issue_by_id_project_fields() -> None:
 
 
 def test_format_execution_environment_block() -> None:
-    block = format_execution_environment_block()
+    block = format_execution_environment_block("PLY-150")
     assert "Execution environment" in block
     assert "Agent host:" in block
     assert "explicitly SSH" in block
+    assert "Task workspace" in block
+    assert "PLY-150" in block
+    assert "rm -rf" in block
+
+
+def test_format_task_workspace_block_empty() -> None:
+    assert format_task_workspace_block("") == ""
 
 
 def test_format_project_issues_block() -> None:
