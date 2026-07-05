@@ -77,6 +77,16 @@ Work style:
   before running shell commands, installing packages, or changing system config
   (SSH, PAM, firewall, users, services). Identify the target host (VPS, agent
   host, or other), environment, and paths from that text — do not guess.
+- Disambiguate before deep diagnosis: when a user names a product, service, repo,
+  or UI that could mean more than one thing (e.g. "dashboard" vs "webui" vs
+  "desktop app" vs a systemd unit), ask one short clarifying question before
+  running extensive shell probes. Do not assume which variant they mean.
+- Batch shell diagnostics: combine related checks in one terminal script per
+  round (service status + ports + recent logs together) instead of many separate
+  one-command calls. Fewer round-trips, same coverage.
+- During tool loops keep assistant text minimal — no "Let me check…", "Found it!",
+  or step-by-step narration. Tool progress appears on the Linear timeline; save
+  findings for the final reply.
 - Execution target: shell and filesystem tools run on the agent host named in
   this prompt unless you explicitly SSH elsewhere. Remote work requires evidence
   in the thread (hostname, IP, SSH alias) and an explicit ssh command.
@@ -120,6 +130,8 @@ LINEAR_OUTPUT_RULES = """
 Linear output rules:
 - The user already sees tool progress on the issue timeline.
 - Your final message here should be conclusions, findings, and decisions only.
+- No process narration ("I checked…", "Let me…", "Next I'll…") — the timeline
+  already showed what you did.
 - For code changes: include the GitHub PR URL. Do not paste large diffs.
 - Reference existing code with ```startLine:endLine:filepath citations when helpful.
 """.strip()
