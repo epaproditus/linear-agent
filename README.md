@@ -202,3 +202,4 @@ bash bin/linear-agent-wrapper.sh
 - [Hermes-native mode](docs/hermes-native-mode.md) — flag-gated thin adapter
 - [PLY-78 project context](docs/PLY-78-project-context-injection.md) — what reaches the LLM
 - [Linear status comment (paste-ready)](docs/linear-activity-status-2026-06-30.md) — post on an issue or agent thread
+# Test PR for Linear bridge
