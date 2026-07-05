@@ -10,6 +10,8 @@ from linear_agent import (
     AgentSession,
     HERMES_NATIVE_TODO_HINT,
     LINEAR_OUTPUT_RULES,
+    THREAD_CONTEXT_FOOTER,
+    THREAD_CONTEXT_HEADER,
     SessionAction,
     SessionPlanTracker,
     Settings,
@@ -119,7 +121,11 @@ class TestBuildNativeTurnMessage(unittest.TestCase):
             self.session,
             self.issue,
             "Fix the SSH target",
-            conversation_text="[10:00] **User:** earlier note",
+            thread_context=(
+                f"{THREAD_CONTEXT_HEADER}\n"
+                "User: earlier note\n"
+                f"{THREAD_CONTEXT_FOOTER}"
+            ),
             project_issues_block=siblings,
             include_full_context=True,
         )
@@ -127,7 +133,8 @@ class TestBuildNativeTurnMessage(unittest.TestCase):
         self.assertIn("Project: Home Lab", msg)
         self.assertIn("Team/workspace guidance:", msg)
         self.assertIn("Recent issues in this project", msg)
-        self.assertIn("User request:\nFix the SSH target", msg)
+        self.assertIn("Fix the SSH target", msg)
+        self.assertIn(THREAD_CONTEXT_HEADER, msg)
         self.assertIn(HERMES_NATIVE_TODO_HINT, msg)
         self.assertIn("Confirm target hosts", msg)
         self.assertIn(LINEAR_OUTPUT_RULES.strip()[:40], msg)
@@ -139,14 +146,20 @@ class TestBuildNativeTurnMessage(unittest.TestCase):
             self.session,
             self.issue,
             "Any update?",
-            conversation_text="[11:00] **User:** follow-up thread",
+            thread_context=(
+                f"{THREAD_CONTEXT_HEADER}\n"
+                "User: follow-up thread\n"
+                f"{THREAD_CONTEXT_FOOTER}"
+            ),
             include_full_context=False,
         )
-        self.assertIn("Follow-up on PLY-78", msg)
-        self.assertIn("User message:\nAny update?", msg)
+        self.assertIn("[Replying on Linear issue PLY-78", msg)
+        self.assertIn("Any update?", msg)
+        self.assertIn(THREAD_CONTEXT_HEADER, msg)
         self.assertNotIn("Issue description:", msg)
         self.assertNotIn("Team/workspace guidance:", msg)
         self.assertNotIn(HERMES_NATIVE_TODO_HINT, msg)
+        self.assertNotIn(LINEAR_OUTPUT_RULES, msg)
 
 
 class TestHermesNativeSettings(unittest.TestCase):

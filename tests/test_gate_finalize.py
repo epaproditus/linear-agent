@@ -150,4 +150,4 @@ def test_native_gate_prompted_includes_hint(
     )
 
     assert GATE_ISSUE_HINT in msg
-    assert "User message:\nWhy TCP?" in msg
+    assert "Why TCP?" in msg
