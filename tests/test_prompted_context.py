@@ -218,11 +218,11 @@ def test_native_prompted_message_omits_full_conversation(issue: dict) -> None:
         session,
         issue,
         "Why can't we do TCP?",
-        conversation_text=delta,
+        thread_context=delta,
         include_full_context=False,
     )
 
-    assert "User message:\nWhy can't we do TCP?" in msg
+    assert "[Replying on Linear issue PLY-112" in msg
     assert GATE_DESCRIPTION not in msg
     assert "Full conversation" not in msg
     assert "Why can't we do TCP?" in msg

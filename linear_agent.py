@@ -77,16 +77,6 @@ Work style:
   before running shell commands, installing packages, or changing system config
   (SSH, PAM, firewall, users, services). Identify the target host (VPS, agent
   host, or other), environment, and paths from that text — do not guess.
-- Disambiguate before deep diagnosis: when a user names a product, service, repo,
-  or UI that could mean more than one thing (e.g. "dashboard" vs "webui" vs
-  "desktop app" vs a systemd unit), ask one short clarifying question before
-  running extensive shell probes. Do not assume which variant they mean.
-- Batch shell diagnostics: combine related checks in one terminal script per
-  round (service status + ports + recent logs together) instead of many separate
-  one-command calls. Fewer round-trips, same coverage.
-- During tool loops keep assistant text minimal — no "Let me check…", "Found it!",
-  or step-by-step narration. Tool progress appears on the Linear timeline; save
-  findings for the final reply.
 - Execution target: shell and filesystem tools run on the agent host named in
   this prompt unless you explicitly SSH elsewhere. Remote work requires evidence
   in the thread (hostname, IP, SSH alias) and an explicit ssh command.
@@ -130,11 +120,18 @@ LINEAR_OUTPUT_RULES = """
 Linear output rules:
 - The user already sees tool progress on the issue timeline.
 - Your final message here should be conclusions, findings, and decisions only.
-- No process narration ("I checked…", "Let me…", "Next I'll…") — the timeline
-  already showed what you did.
 - For code changes: include the GitHub PR URL. Do not paste large diffs.
 - Reference existing code with ```startLine:endLine:filepath citations when helpful.
 """.strip()
+
+# Slack gateway mirrors this block when prepending thread history that is not
+# yet in the Hermes session. Linear native mode uses the same shape per turn.
+THREAD_CONTEXT_HEADER = (
+    "[Thread context — prior messages on this issue (not yet in conversation "
+    "history). Your Hermes session retains prior tool work and assistant "
+    "turns — respond to the new message below.]"
+)
+THREAD_CONTEXT_FOOTER = "[End of thread context]"
 
 HERMES_NATIVE_TODO_HINT = (
     "For multi-step work, use the todo tool to track steps."
@@ -1456,6 +1453,51 @@ def build_conversation_text(
     return "\n\n" + "\n".join(lines) + "\n"
 
 
+def _is_human_comment(c: dict[str, Any], agent_bot_name: str) -> bool:
+    body = (c.get("body") or "").strip()
+    if not body or _is_linear_system_comment(body):
+        return False
+    author = (c.get("user") or {}).get("name", "")
+    return not _is_agent_author(author, agent_bot_name)
+
+
+def build_thread_context_block(
+    flat: list[tuple[int, dict[str, Any]]],
+    *,
+    since_watermark: str | None = None,
+    agent_bot_name: str = "Hermes",
+    exclude_bodies: frozenset[str] | None = None,
+) -> str:
+    """Slack-gateway-style prior human comments not yet in the Hermes session."""
+    if not flat:
+        return ""
+    sorted_flat = sorted(flat, key=lambda item: _comment_sort_key(item[1]))
+    if since_watermark:
+        candidates = filter_comments_since_watermark(sorted_flat, since_watermark)
+    else:
+        candidates = sorted_flat
+
+    exclude = exclude_bodies or frozenset()
+    lines: list[str] = []
+    for _, c in candidates:
+        if not _is_human_comment(c, agent_bot_name):
+            continue
+        body = (c.get("body") or "").strip()
+        if _normalize_comment_body(body) in exclude:
+            continue
+        author = (c.get("user") or {}).get("name", "Unknown")
+        lines.append(f"{author}: {body}")
+
+    if not lines:
+        return ""
+
+    return (
+        f"{THREAD_CONTEXT_HEADER}\n"
+        + "\n".join(lines)
+        + f"\n{THREAD_CONTEXT_FOOTER}"
+    )
+
+
 def _is_agent_author(name: str, agent_bot_name: str) -> bool:
     lowered = (name or "").strip().lower()
     if not lowered:
@@ -2677,13 +2719,19 @@ class TaskProcessor:
         issue: dict[str, Any],
         user_request: str,
         *,
-        conversation_text: str = "",
+        thread_context: str = "",
         project_issues_block: str = "",
         relations_block: str = "",
         include_full_context: bool = True,
         gate_mode: bool = False,
     ) -> str:
-        """Minimal turn payload for Hermes-native mode (one session per assignment)."""
+        """Minimal turn payload for Hermes-native mode (one session per assignment).
+
+        Follows the Slack gateway per-turn model:
+        - **Created:** one-time issue card + thread context + new user message.
+        - **Prompted:** thread context (delta) + new user message only — Hermes
+          session retains prior issue card, tools, and assistant turns.
+        """
         identifier = issue.get("identifier", session.issue_identifier)
         title = issue.get("title", session.title)
         state = issue.get("state", {})
@@ -2717,11 +2765,11 @@ class TaskProcessor:
                 parts.append(guidance_block.rstrip())
             if description:
                 parts.append(f"Issue description:\n{description}")
-            if conversation_text.strip():
-                parts.append(conversation_text.strip())
-            tail = [
-                f"User request:\n{user_request}",
-            ]
+            if thread_context.strip():
+                parts.append(thread_context.strip())
+            if user_request.strip():
+                parts.append(user_request.strip())
+            tail: list[str] = []
             if gate_mode:
                 tail.append(GATE_ISSUE_HINT)
             else:
@@ -2753,24 +2801,16 @@ class TaskProcessor:
             parts.extend(tail)
             return "\n\n".join(parts)
 
-        # Follow-up turn — delta only; Hermes session retains prior work.
+        # Follow-up — Slack gateway shape: anchor + thread context + new message.
         parts = [
-            f"Follow-up on {identifier} — {title}",
-            f"Status: {state.get('name', 'Unknown')}",
-            f"User message:\n{user_request}",
+            f"[Replying on Linear issue {identifier} — {title}]",
         ]
-        if conversation_text.strip():
-            parts.append(conversation_text.strip())
+        if thread_context.strip():
+            parts.append(thread_context.strip())
+        if user_request.strip():
+            parts.append(user_request.strip())
         if gate_mode:
             parts.append(GATE_ISSUE_HINT)
-        if relations_block:
-            parts.append(relations_block.rstrip())
-        if unfinished_blockers(issue):
-            parts.append(
-                "Note: this issue still has unfinished blockers. "
-                "Confirm with the user before substantial implementation work."
-            )
-        parts.append(LINEAR_OUTPUT_RULES)
         return "\n\n".join(parts)
 
     async def _sync_plan_from_hermes_todos(
@@ -2986,11 +3026,20 @@ class TaskProcessor:
                 )
                 project_issues_block = format_project_issues_block(siblings)
 
+            thread_context = build_thread_context_block(
+                flat,
+                since_watermark=conversation_since if use_delta else None,
+                agent_bot_name=settings.linear_agent_bot_name,
+                exclude_bodies=frozenset({
+                    _normalize_comment_body(user_request),
+                }),
+            )
+
             prompt = self.build_native_turn_message(
                 session,
                 issue,
                 user_request,
-                conversation_text=conversation_text,
+                thread_context=thread_context,
                 project_issues_block=project_issues_block,
                 relations_block=relations_block,
                 include_full_context=(session.action != SessionAction.prompted),
