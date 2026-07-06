@@ -46,6 +46,14 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from run_registry import (
+    RunEvent,
+    RunRegistry,
+    RunState,
+    _short_run_id,
+    tool_progress_to_audit_event,
+)
+
 # ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -147,6 +155,7 @@ Human gate issue — help Abraham decide, do not execute:
 
 WATERMARK_STORE_DIR = Path.home() / ".linear-agent"
 WATERMARK_STORE_PATH = WATERMARK_STORE_DIR / "conversation_watermarks.json"
+RUNS_STORE_PATH = WATERMARK_STORE_DIR / "runs.db"
 
 # Map embedded shell/git commands to short checklist labels.
 _PLAN_COMMAND_LABELS: list[tuple[re.Pattern[str], str]] = [
@@ -216,6 +225,12 @@ class Settings(BaseSettings):
     linear_defer_on_blockers: bool = True
     """Refuse new work on created turns when blocked by unfinished issues."""
 
+    runs_db_path: str = str(RUNS_STORE_PATH)
+    """SQLite path for the run registry and tool audit trail."""
+
+    runs_api_key: str = ""
+    """Bearer token for /v1/runs API. Defaults to HERMES_API_KEY when empty."""
+
     @property
     def allowed_team_ids(self) -> set[str]:
         """Team IDs from LINEAR_TEAM_IDS and/or ALLOWED_TEAM_IDS."""
@@ -240,6 +255,10 @@ class Settings(BaseSettings):
     @property
     def configured(self) -> bool:
         return bool(self.linear_api_key) and bool(self.linear_webhook_secret)
+
+    @property
+    def runs_api_auth_key(self) -> str:
+        return self.runs_api_key or self.hermes_api_key
 
 
 settings = Settings()
@@ -2405,14 +2424,33 @@ def format_hermes_tool_progress(event: dict) -> str | None:
     return text
 
 
+def linear_trigger_for_session(session: AgentSession) -> str:
+    """Map a Linear agent session to a run registry trigger label."""
+    return f"linear.session.{session.action.value}"
+
+
+def append_run_footer(response_text: str, run_id: str) -> str:
+    """Append a short run correlation footer to a Linear response."""
+    short_id = _short_run_id(run_id)
+    footer = f"\n\n_Run `{short_id}`_"
+    if short_id in response_text or run_id in response_text:
+        return response_text
+    return f"{response_text.rstrip()}{footer}"
+
+
 # ── Task Processor ──────────────────────────────────────────────────────
 
 
 class TaskProcessor:
     """Processes an agent session — analyzes the issue, takes action."""
 
-    def __init__(self, linear: LinearClient) -> None:
+    def __init__(
+        self,
+        linear: LinearClient,
+        runs: RunRegistry | None = None,
+    ) -> None:
         self.linear = linear
+        self.runs = runs
         self._viewer_id: str | None = None
 
     async def ensure_viewer_id(self) -> str:
@@ -2472,6 +2510,7 @@ class TaskProcessor:
         issue: dict[str, Any] | None,
         *,
         conversation_since: str | None = None,
+        run_id: str | None = None,
     ) -> str:
         """Main processing pipeline for a session.
 
@@ -2480,10 +2519,14 @@ class TaskProcessor:
         """
         session_id = session.session_id
         issue_id = session.issue_id
+        log_prefix = f"[run={_short_run_id(run_id)}] " if run_id else ""
         log.info(
-            "Processing session=%s issue=%s action=%s",
-            session_id, session.issue_identifier, session.action.value,
+            "%sProcessing session=%s issue=%s action=%s",
+            log_prefix, session_id, session.issue_identifier, session.action.value,
         )
+
+        if run_id and self.runs:
+            self.runs.transition(run_id, RunState.running)
 
         # 1. Do not emit a visible acknowledgement. Linear only requires an
         # activity OR external URL update within 10s; `update_session` below
@@ -2499,6 +2542,12 @@ class TaskProcessor:
                     session_id,
                     f"Could not fetch issue {session.issue_identifier}.",
                 )
+                if run_id and self.runs:
+                    self.runs.transition(
+                        run_id,
+                        RunState.failed,
+                        error="issue_not_found",
+                    )
                 return ""
 
             title = issue.get("title", session.title)
@@ -2520,14 +2569,18 @@ class TaskProcessor:
             if should_defer_for_blockers(issue, session):
                 blockers = unfinished_blockers(issue)
                 identifier = issue.get("identifier", session.issue_identifier)
-                await self.linear.send_response(
-                    session_id,
-                    format_blocked_deferral_message(identifier, blockers),
-                )
+                deferral_msg = format_blocked_deferral_message(identifier, blockers)
+                await self.linear.send_response(session_id, deferral_msg)
                 log.info(
-                    "Deferred session %s — %d open blocker(s)",
-                    session_id[:8], len(blockers),
+                    "%sDeferred session %s — %d open blocker(s)",
+                    log_prefix, session_id[:8], len(blockers),
                 )
+                if run_id and self.runs:
+                    self.runs.transition(
+                        run_id,
+                        RunState.completed,
+                        metadata_patch={"outcome": "deferred", "blockers": len(blockers)},
+                    )
                 return ""
 
             # 3. Set self as delegate if not already set (per Linear best practices)
@@ -2544,22 +2597,27 @@ class TaskProcessor:
                     await self.linear.update_issue(issue_id, stateId=started_id)
 
             # 6. Route to Hermes LLM reasoning
-            log.info("Routing to _handle_analysis")
+            log.info("%sRouting to _handle_analysis", log_prefix)
             return await self._handle_analysis(
                 session,
                 issue,
                 session_id,
                 conversation_since=conversation_since,
+                run_id=run_id,
             )
 
         except asyncio.CancelledError:
+            if run_id and self.runs:
+                self.runs.transition(run_id, RunState.cancelled)
             raise
         except Exception as e:
-            log.exception("Error processing session %s", session_id)
+            log.exception("%sError processing session %s", log_prefix, session_id)
             await self.linear.send_error(
                 session_id,
                 f"An error occurred while processing this issue:\n```\n{e}\n```",
             )
+            if run_id and self.runs:
+                self.runs.transition(run_id, RunState.failed, error=str(e))
             return conversation_since or ""
 
     def build_llm_prompt(
@@ -2975,6 +3033,7 @@ class TaskProcessor:
         session_id: str,
         *,
         conversation_since: str | None = None,
+        run_id: str | None = None,
     ) -> str:
         """Non-coding task: use LLM to reason and respond intelligently."""
         identifier = issue.get("identifier", session.issue_identifier)
@@ -3102,7 +3161,7 @@ class TaskProcessor:
 
         try:
             draft_text = await self._call_llm(
-                prompt, session_id, tracker, plan=plan,
+                prompt, session_id, tracker, plan=plan, run_id=run_id,
             )
         finally:
             keepalive_task.cancel()
@@ -3148,7 +3207,17 @@ class TaskProcessor:
             if settings.hermes_native_mode:
                 await self._sync_plan_from_hermes_todos(plan, session_id)
             await plan.finish()
+            if run_id:
+                response_text = append_run_footer(response_text, run_id)
             await self.linear.send_response(session_id, response_text)
+            if run_id and self.runs:
+                self.runs.transition(
+                    run_id,
+                    RunState.completed,
+                    metadata_patch={
+                        "tool_events": len(tracker.tool_progress) if tracker else 0,
+                    },
+                )
             # Task complete — move to "In Review" for the user (not gate issues)
             if (
                 session.action != SessionAction.prompted
@@ -3163,10 +3232,19 @@ class TaskProcessor:
                     if review_id:
                         await self.linear.update_issue(issue_id_local, stateId=review_id)
         else:
-            await self.linear.send_response(
-                session_id,
-                f"Could not generate a response. Status: {issue.get('state', {}).get('name', 'Unknown')}",
+            failure_msg = (
+                f"Could not generate a response. Status: "
+                f"{issue.get('state', {}).get('name', 'Unknown')}"
             )
+            if run_id:
+                failure_msg = append_run_footer(failure_msg, run_id)
+            await self.linear.send_response(session_id, failure_msg)
+            if run_id and self.runs:
+                self.runs.transition(
+                    run_id,
+                    RunState.failed,
+                    error="empty_llm_response",
+                )
 
         return watermark_out
 
@@ -3174,6 +3252,7 @@ class TaskProcessor:
         self, prompt: str, session_id: str = "",
         tracker: DiscoveryTracker | None = None,
         plan: SessionPlanTracker | None = None,
+        run_id: str | None = None,
     ) -> str | None:
         """Call Hermes API server for reasoning with streaming support.
 
@@ -3268,6 +3347,12 @@ class TaskProcessor:
                                 discovery = format_hermes_tool_progress(
                                     progress_data,
                                 )
+                                if run_id and self.runs:
+                                    audit_event = tool_progress_to_audit_event(
+                                        progress_data,
+                                        summary=discovery,
+                                    )
+                                    self.runs.append_event(run_id, audit_event)
                                 if (
                                     discovery
                                     and tracker
@@ -3533,11 +3618,16 @@ class AgentWebhookHandler:
     """Processes incoming Linear webhooks and manages agent sessions."""
 
     def __init__(
-        self, linear: LinearClient, processor: TaskProcessor
+        self,
+        linear: LinearClient,
+        processor: TaskProcessor,
+        runs: RunRegistry | None = None,
     ) -> None:
         self.linear = linear
         self.processor = processor
+        self.runs = runs
         self._active_runs: dict[str, asyncio.Task[None]] = {}
+        self._session_run_ids: dict[str, str] = {}
         self._dedup_cache: dict[str, float] = {}
         self._watermark_store = ConversationWatermarkStore()
         # Rate limiting
@@ -3679,7 +3769,14 @@ class AgentWebhookHandler:
             existing = self._active_runs.get(session_id)
             if existing and not existing.done():
                 existing.cancel()
-                log.info("Stop signal received; cancelling session %s", session_id[:8])
+                run_id = self._session_run_ids.get(session_id)
+                if run_id and self.runs:
+                    self.runs.transition(run_id, RunState.cancelled)
+                log.info(
+                    "[run=%s] Stop signal received; cancelling session %s",
+                    _short_run_id(run_id) if run_id else "--------",
+                    session_id[:8],
+                )
                 await self.linear.send_response(
                     session_id,
                     "Stopped. Work has been halted as requested.",
@@ -3737,6 +3834,21 @@ class AgentWebhookHandler:
 
     async def _run_session(self, session: AgentSession) -> None:
         """Background task for an agent session."""
+        run_id: str | None = None
+        if self.runs:
+            run_id = self.runs.create_run(
+                trigger=linear_trigger_for_session(session),
+                linear_session_id=session.session_id,
+                issue_id=session.issue_id,
+                issue_identifier=session.issue_identifier,
+                hermes_session_id=session.session_id,
+                metadata={
+                    "action": session.action.value,
+                    "team_id": session.team_id,
+                },
+            )
+            self._session_run_ids[session.session_id] = run_id
+
         async with self._concurrency_semaphore:
             try:
                 issue = await self.linear.get_issue(session.issue_id)
@@ -3747,14 +3859,27 @@ class AgentWebhookHandler:
                     session,
                     issue,
                     conversation_since=conversation_since or None,
+                    run_id=run_id,
                 )
                 if watermark:
                     self._watermark_store.set(session.session_id, watermark)
             except asyncio.CancelledError:
-                log.info("Session %s cancelled via stop signal", session.session_id[:8])
+                if run_id and self.runs:
+                    self.runs.transition(run_id, RunState.cancelled)
+                log.info(
+                    "[run=%s] Session %s cancelled via stop signal",
+                    _short_run_id(run_id) if run_id else "--------",
+                    session.session_id[:8],
+                )
                 raise
             except Exception as e:
-                log.exception("Session %s crashed", session.session_id)
+                log.exception(
+                    "[run=%s] Session %s crashed",
+                    _short_run_id(run_id) if run_id else "--------",
+                    session.session_id,
+                )
+                if run_id and self.runs:
+                    self.runs.transition(run_id, RunState.failed, error=str(e))
                 try:
                     await self.linear.send_error(
                         session.session_id,
@@ -3764,7 +3889,12 @@ class AgentWebhookHandler:
                     log.exception("Failed to send error activity")
             finally:
                 self._active_runs.pop(session.session_id, None)
-                log.info("Session %s complete", session.session_id[:8])
+                self._session_run_ids.pop(session.session_id, None)
+                log.info(
+                    "[run=%s] Session %s complete",
+                    _short_run_id(run_id) if run_id else "--------",
+                    session.session_id[:8],
+                )
 
     async def _process_with_semaphore(
         self, session: AgentSession, issue: dict[str, Any] | None
@@ -3774,15 +3904,43 @@ class AgentWebhookHandler:
         Used by _handle_comment and _handle_issue_update which spawn
         processing directly without going through _run_session.
         """
-        async with self._concurrency_semaphore:
-            conversation_since = self._watermark_store.get(session.session_id)
-            watermark = await self.processor.process(
-                session,
-                issue,
-                conversation_since=conversation_since or None,
+        run_id: str | None = None
+        if self.runs:
+            run_id = self.runs.create_run(
+                trigger=linear_trigger_for_session(session),
+                linear_session_id=session.session_id,
+                issue_id=session.issue_id,
+                issue_identifier=session.issue_identifier,
+                hermes_session_id=session.session_id,
+                metadata={
+                    "action": session.action.value,
+                    "team_id": session.team_id,
+                    "source": "proactive_session",
+                },
             )
-            if watermark:
-                self._watermark_store.set(session.session_id, watermark)
+            self._session_run_ids[session.session_id] = run_id
+
+        async with self._concurrency_semaphore:
+            try:
+                conversation_since = self._watermark_store.get(session.session_id)
+                watermark = await self.processor.process(
+                    session,
+                    issue,
+                    conversation_since=conversation_since or None,
+                    run_id=run_id,
+                )
+                if watermark:
+                    self._watermark_store.set(session.session_id, watermark)
+            except asyncio.CancelledError:
+                if run_id and self.runs:
+                    self.runs.transition(run_id, RunState.cancelled)
+                raise
+            except Exception as e:
+                if run_id and self.runs:
+                    self.runs.transition(run_id, RunState.failed, error=str(e))
+                raise
+            finally:
+                self._session_run_ids.pop(session.session_id, None)
 
     async def _handle_comment(self, payload: dict[str, Any]) -> str:
         """Handle @mentions in comments."""
@@ -3909,6 +4067,37 @@ class AgentWebhookHandler:
         return "no action"
 
 
+# ── Run registry API models ───────────────────────────────────────────────
+
+
+class RunCreateRequest(BaseModel):
+    trigger: str = "api.manual"
+    linear_session_id: str | None = None
+    issue_id: str | None = None
+    issue_identifier: str | None = None
+    hermes_session_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunPatchRequest(BaseModel):
+    state: RunState
+    error: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+def verify_runs_api_auth(request: Request) -> None:
+    """Require bearer token for /v1/runs endpoints."""
+    auth_key = settings.runs_api_auth_key
+    if not auth_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Runs API is not configured (set HERMES_API_KEY or RUNS_API_KEY)",
+        )
+    header = request.headers.get("Authorization", "")
+    if header != f"Bearer {auth_key}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 # ── FastAPI App ─────────────────────────────────────────────────────────
 
 
@@ -3927,11 +4116,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Create shared clients
     linear = LinearClient(settings.linear_api_key)
-    processor = TaskProcessor(linear)
-    handler = AgentWebhookHandler(linear, processor)
+    runs = RunRegistry(Path(settings.runs_db_path))
+    processor = TaskProcessor(linear, runs=runs)
+    handler = AgentWebhookHandler(linear, processor, runs=runs)
 
     # Stash on app
     app.state.linear = linear
+    app.state.runs = runs
     app.state.handler = handler
 
     # Verify API connectivity
@@ -3965,6 +4156,83 @@ async def health() -> dict[str, Any]:
         "agent": "linear-agent",
         "model": settings.hermes_model,
     }
+
+
+@app.post("/v1/runs")
+async def create_run(request: Request, body: RunCreateRequest) -> dict[str, Any]:
+    """Create a run record (registry bookkeeping; does not start execution)."""
+    verify_runs_api_auth(request)
+    runs: RunRegistry = request.app.state.runs
+    run_id = runs.create_run(
+        trigger=body.trigger,
+        linear_session_id=body.linear_session_id,
+        issue_id=body.issue_id,
+        issue_identifier=body.issue_identifier,
+        hermes_session_id=body.hermes_session_id,
+        metadata=body.metadata,
+    )
+    record = runs.get_run(run_id)
+    assert record is not None
+    return record.to_dict(include_events=False)
+
+
+@app.get("/v1/runs")
+async def list_runs(
+    request: Request,
+    state: str | None = None,
+    issue_id: str | None = None,
+    linear_session_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List run records with optional filters."""
+    verify_runs_api_auth(request)
+    runs: RunRegistry = request.app.state.runs
+    records = runs.list_runs(
+        state=state,
+        issue_id=issue_id,
+        linear_session_id=linear_session_id,
+        limit=min(max(limit, 1), 200),
+        offset=max(offset, 0),
+    )
+    return {
+        "runs": [record.to_dict(include_events=False) for record in records],
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/v1/runs/{run_id}")
+async def get_run(request: Request, run_id: str) -> dict[str, Any]:
+    """Fetch a single run record including tool audit events."""
+    verify_runs_api_auth(request)
+    runs: RunRegistry = request.app.state.runs
+    record = runs.get_run(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return record.to_dict(include_events=True)
+
+
+@app.patch("/v1/runs/{run_id}")
+async def patch_run(
+    request: Request,
+    run_id: str,
+    body: RunPatchRequest,
+) -> dict[str, Any]:
+    """Transition a run to a new lifecycle state."""
+    verify_runs_api_auth(request)
+    runs: RunRegistry = request.app.state.runs
+    if runs.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    runs.transition(
+        run_id,
+        body.state,
+        error=body.error,
+        metadata_patch=body.metadata,
+    )
+    record = runs.get_run(run_id)
+    assert record is not None
+    return record.to_dict(include_events=True)
 
 
 @app.post("/linear/webhook")
