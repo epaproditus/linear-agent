@@ -147,6 +147,7 @@ Human gate issue — help Abraham decide, do not execute:
 
 WATERMARK_STORE_DIR = Path.home() / ".linear-agent"
 WATERMARK_STORE_PATH = WATERMARK_STORE_DIR / "conversation_watermarks.json"
+DEDUP_STORE_PATH = WATERMARK_STORE_DIR / "dedup.json"
 
 # Map embedded shell/git commands to short checklist labels.
 _PLAN_COMMAND_LABELS: list[tuple[re.Pattern[str], str]] = [
@@ -196,7 +197,10 @@ class Settings(BaseSettings):
     """If true, only accept webhooks from known IPs."""
 
     allowed_ips: str = ""
-    """Comma-separated custom IP allowlist. Merged with known Linear IPs."""
+    """Comma-separated custom IP allowlist. Merged with LINEAR_ALLOWED_IPS / known Linear IPs."""
+
+    linear_allowed_ips: str = ""
+    """Comma-separated fallback allowlist when LINEAR_ALLOWED_IPS env var is set."""
 
     hermes_api_url: str = "http://127.0.0.1:8642/v1"
     """Hermes API server URL for LLM reasoning."""
@@ -213,8 +217,14 @@ class Settings(BaseSettings):
     hermes_native_mode: bool = False
     """Thin Hermes-native adapter: one session, todo→plan, no synthetic planning."""
 
+    hermes_analysis_max_tokens: int = 4096
+    """Default max_tokens for the main streaming analysis LLM call."""
+
     linear_defer_on_blockers: bool = True
     """Refuse new work on created turns when blocked by unfinished issues."""
+
+    graceful_shutdown_timeout: float = 10.0
+    """Seconds to wait for active agent runs during shutdown before giving up."""
 
     @property
     def allowed_team_ids(self) -> set[str]:
@@ -229,12 +239,13 @@ class Settings(BaseSettings):
 
     @property
     def allowed_ips_set(self) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-        """Merged set of known Linear IPs + custom ALLOWED_IPS env var."""
+        """Merged set of known Linear IPs, LINEAR_ALLOWED_IPS, and custom ALLOWED_IPS env var."""
         ips = set(LINEAR_IPS)
-        for ip_str in self.allowed_ips.split(","):
-            ip_str = ip_str.strip()
-            if ip_str:
-                ips.add(ip_str)
+        for raw in (self.linear_allowed_ips, self.allowed_ips):
+            for ip_str in raw.split(","):
+                ip_str = ip_str.strip()
+                if ip_str:
+                    ips.add(ip_str)
         return {ipaddress.ip_address(i) for i in ips}
 
     @property
@@ -422,6 +433,13 @@ query Projects {
 }
 """
 
+GQL_ISSUE_SESSIONS = """
+query IssueAgentSessions($issueId: String!, $first: Int!) {
+  agentSessions(filter: { issueId: { eq: $issueId } }, first: $first) {
+    nodes { id }
+  }
+}
+"""
 GQL_PROJECT_CREATE = """
 mutation ProjectCreate($input: ProjectCreateInput!) {
   projectCreate(input: $input) {
@@ -3213,7 +3231,7 @@ class TaskProcessor:
                                 {"role": "user", "content": prompt}
                             ],
                             "temperature": 0.7,
-                            "max_tokens": 1000,
+                            "max_tokens": settings.hermes_analysis_max_tokens,
                             "stream": True,
                             "stream_tool_progress": True,
                         },
@@ -3538,7 +3556,7 @@ class AgentWebhookHandler:
         self.linear = linear
         self.processor = processor
         self._active_runs: dict[str, asyncio.Task[None]] = {}
-        self._dedup_cache: dict[str, float] = {}
+        self._dedup_cache: dict[str, float] = self._load_dedup()
         self._watermark_store = ConversationWatermarkStore()
         # Rate limiting
         self._concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
@@ -3546,6 +3564,29 @@ class AgentWebhookHandler:
             max_requests=RATE_LIMIT_MAX_REQUESTS,
             window_s=RATE_LIMIT_WINDOW_S,
         )
+
+    def _load_dedup(self) -> dict[str, float]:
+        """Load persisted dedup entries from disk, if available."""
+        try:
+            if DEDUP_STORE_PATH.exists():
+                data = json.loads(DEDUP_STORE_PATH.read_text("utf-8"))
+                if isinstance(data, dict):
+                    return {str(k): float(v) for k, v in data.items()}
+        except Exception:
+            log.warning("Failed to load dedup cache", exc_info=True)
+        return {}
+
+    def _persist_dedup(self) -> None:
+        """Persist current dedup cache to disk with an immediate fsync."""
+        try:
+            WATERMARK_STORE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = DEDUP_STORE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._dedup_cache), "utf-8")
+            with tmp.open("r+b") as f:
+                os.fsync(f.fileno())
+            tmp.replace(DEDUP_STORE_PATH)
+        except Exception:
+            log.warning("Failed to persist dedup cache", exc_info=True)
 
     def _check_dedup(self, key: str, ttl: float = 60.0) -> bool:
         """Returns True if this event was recently processed."""
@@ -3559,6 +3600,7 @@ class AgentWebhookHandler:
         if key in self._dedup_cache and now - self._dedup_cache[key] < ttl:
             return True  # Duplicate
         self._dedup_cache[key] = now
+        self._persist_dedup()
         return False
 
     async def _is_self_comment(self, payload: dict[str, Any]) -> bool:
@@ -3943,9 +3985,28 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
-    # Shutdown
+    # Graceful shutdown: cancel active runs and drain them
+    shutdown_timeout = settings.graceful_shutdown_timeout
+    app_state_handler: AgentWebhookHandler = app.state.handler
+    active_tasks = [task for task in app_state_handler._active_runs.values() if not task.done()]
+    if active_tasks:
+        log.info("Shutting down: cancelling %d active run(s)", len(active_tasks))
+        for task in active_tasks:
+            task.cancel()
+
+        done, pending = await asyncio.wait(active_tasks, timeout=shutdown_timeout)
+        if pending:
+            log.warning(
+                "Shutdown: %d run(s) did not finish within %ss",
+                len(pending),
+                shutdown_timeout,
+            )
+
+    # Close HTTP clients last, after workers are stopped
     await linear.close()
-    log.info("Linear agent shut down.")
+
+    finished = sum(1 for t in active_tasks if t.done())
+    log.info("Linear agent shut down. finished=%d/%d", finished, len(active_tasks))
 
 
 app = FastAPI(
@@ -3959,12 +4020,47 @@ app = FastAPI(
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    """Health check endpoint."""
-    return {
-        "status": "ok",
+    """Health check endpoint with downstream connectivity checks."""
+    statuses: dict[str, Any] = {
         "agent": "linear-agent",
         "model": settings.hermes_model,
+        "linear": {"status": "unknown"},
+        "hermes": {"status": "unknown"},
     }
+
+    linear_client = app.state.linear if hasattr(app.state, "linear") else None
+
+    try:
+        viewer = await linear_client.get_viewer()
+        statuses["linear"] = {
+            "status": "ok",
+            "id": viewer.get("id"),
+            "name": viewer.get("name"),
+            "email": viewer.get("email"),
+        }
+    except Exception as e:
+        statuses["linear"] = {"status": "error", "error": str(e)}
+
+    try:
+        url = f"{settings.hermes_api_url.rstrip('/')}/health"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+            statuses["hermes"] = {
+                "status": "ok" if resp.status_code < 400 else "error",
+                "http_status": resp.status_code,
+            }
+            try:
+                statuses["hermes"]["body"] = resp.json()
+            except Exception:
+                statuses["hermes"]["body"] = resp.text
+    except Exception as e:
+        statuses["hermes"] = {"status": "error", "error": str(e)}
+
+    overall = "ok" if all(
+        s.get("status") == "ok" for s in (statuses.get("linear", {}), statuses.get("hermes", {}))
+    ) else "degraded"
+    statuses["status"] = overall
+    return statuses
 
 
 @app.post("/linear/webhook")
