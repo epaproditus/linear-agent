@@ -225,9 +225,9 @@ Hermes itself supports gateways (Slack, etc.), cron, webhooks, dashboard, sessio
 
 ## Proposed first slice (minimal end-to-end worth shipping)
 
-### Slice 1: **Thin run registry + tool audit trail** (PLY-165a)
+### Slice 1: **Thin run registry + tool audit trail** (PLY-165a) — **in progress**
 
-**Goal:** One durable `run_id` per Linear agent turn (or per session — decide below) with lifecycle tracking and a thin tool audit log, without changing the thin-adapter architecture.
+**Status:** Adapter-side SQLite registry + `/v1/runs` API implemented in `run_registry.py` and `linear_agent.py` (2026-07-06).
 
 **Scope:**
 
