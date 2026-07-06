@@ -200,7 +200,7 @@ class Settings(BaseSettings):
     """Comma-separated custom IP allowlist. Merged with LINEAR_ALLOWED_IPS / known Linear IPs."""
 
     linear_allowed_ips: str = ""
-    """Comma-separated fallback allowlist when LINEAR_ALLOWED_IPS env var is not set."""
+    """Comma-separated fallback allowlist when LINEAR_ALLOWED_IPS env var is set."""
 
     hermes_api_url: str = "http://127.0.0.1:8642/v1"
     """Hermes API server URL for LLM reasoning."""
@@ -239,12 +239,13 @@ class Settings(BaseSettings):
 
     @property
     def allowed_ips_set(self) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-        """Merged set of known Linear IPs + custom ALLOWED_IPS env var."""
+        """Merged set of known Linear IPs, LINEAR_ALLOWED_IPS, and custom ALLOWED_IPS env var."""
         ips = set(LINEAR_IPS)
-        for ip_str in self.allowed_ips.split(","):
-            ip_str = ip_str.strip()
-            if ip_str:
-                ips.add(ip_str)
+        for raw in (self.linear_allowed_ips, self.allowed_ips):
+            for ip_str in raw.split(","):
+                ip_str = ip_str.strip()
+                if ip_str:
+                    ips.add(ip_str)
         return {ipaddress.ip_address(i) for i in ips}
 
     @property
@@ -3557,6 +3558,29 @@ class AgentWebhookHandler:
             window_s=RATE_LIMIT_WINDOW_S,
         )
 
+    def _load_dedup(self) -> dict[str, float]:
+        """Load persisted dedup entries from disk, if available."""
+        try:
+            if DEDUP_STORE_PATH.exists():
+                data = json.loads(DEDUP_STORE_PATH.read_text("utf-8"))
+                if isinstance(data, dict):
+                    return {str(k): float(v) for k, v in data.items()}
+        except Exception:
+            log.warning("Failed to load dedup cache", exc_info=True)
+        return {}
+
+    def _persist_dedup(self) -> None:
+        """Persist current dedup cache to disk with an immediate fsync."""
+        try:
+            WATERMARK_STORE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = DEDUP_STORE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._dedup_cache), "utf-8")
+            with tmp.open("r+b") as f:
+                os.fsync(f.fileno())
+            tmp.replace(DEDUP_STORE_PATH)
+        except Exception:
+            log.warning("Failed to persist dedup cache", exc_info=True)
+
     def _check_dedup(self, key: str, ttl: float = 60.0) -> bool:
         """Returns True if this event was recently processed."""
         now = time.time()
@@ -3569,6 +3593,7 @@ class AgentWebhookHandler:
         if key in self._dedup_cache and now - self._dedup_cache[key] < ttl:
             return True  # Duplicate
         self._dedup_cache[key] = now
+        self._persist_dedup()
         return False
 
     async def _is_self_comment(self, payload: dict[str, Any]) -> bool:
