@@ -3681,7 +3681,6 @@ class AgentWebhookHandler:
         comment_data = agent_session.get("comment", {})
         comment_body = comment_data.get("body", "")
         previous_comments = payload.get("previousComments", [])
-        agent_activity = payload.get("agentActivity", {})
         activity_body = agent_activity.get("body", "")
 
         # Linear auto-creates a session comment like "This thread is for an agent
