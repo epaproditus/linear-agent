@@ -10,7 +10,9 @@
 
 Warp’s Oz platform is a **general-purpose agent orchestration control plane**: triggers → tracked tasks → optional isolated environments → agent execution → persistent, shareable run records → programmatic APIs. Hermes as Linear agent is a **thin integration adapter** around one long-lived Hermes session per Linear `AgentSession`, with strong issue-context injection and live timeline progress — but **no first-class run registry, no cross-trigger scheduling, and no reproducible execution environments**.
 
-The biggest gaps are not “can the agent think?” but **platform primitives**: durable run identity, trigger breadth, environment isolation, team-wide run catalog, and APIs for monitoring. The highest-leverage first slice is a **Hermes `/v1/runs` lifecycle + Linear run correlation** layer — already on the backlog — because it unlocks observability, debugging, and future triggers without rewriting the thin-adapter model.
+The biggest gaps are not “can the agent think?” but **platform primitives**: durable run identity, trigger breadth, environment isolation, team-wide run catalog, and APIs for monitoring. The highest-leverage first slice is a **thin run registry + tool audit trail** — already on the backlog — because it makes runs first-class and inspectable before adding more ways to start them. Headless triggers and schedules layer on top only after that foundation exists.
+
+**Guiding principle:** Make runs first-class and inspectable before adding more ways to start them.
 
 ---
 
@@ -193,41 +195,79 @@ Hermes itself supports gateways (Slack, etc.), cron, webhooks, dashboard, sessio
 
 ---
 
+## Agreed follow-up scope (2026-07-06)
+
+### Want
+
+1. **Thin run registry** as the foundational step — stable `run_id`, status, timestamps, linkage to Linear context (`linear_session_id`, `issue_id`, `hermes_session_id`, trigger type).
+2. **Thin tool audit trail in the same slice** — structured tool events appended alongside lifecycle transitions so runs are inspectable and debuggable from day one (parallel to `DiscoveryTracker`, not a separate phase).
+3. **Headless triggers** only after the registry exists and there is a **concrete CI/webhook/API use case** — not speculative.
+4. **Scheduled triage** built on top of registry + headless trigger path.
+5. **Dedicated dashboard** only if Linear proves insufficient as the primary inspection surface.
+
+### Don’t want yet
+
+- Dedicated dashboard UI before proving Linear is insufficient
+- Per-run environments / Docker-style isolation
+- Multi-agent orchestration / child runs
+- Large platform build-out without clear operational need
+
+### Practical order
+
+```
+1. Run registry + thin tool audit trail   (PLY-165a)
+2. Headless trigger                       (PLY-165b) — when use case exists
+3. Scheduled triage                       (PLY-165c) — on top of 1 + 2
+4. Dedicated dashboard                    (PLY-165d) — only if Linear stops being enough
+```
+
+---
+
 ## Proposed first slice (minimal end-to-end worth shipping)
 
-### Slice: **Hermes Run Registry + Linear correlation** (PLY-165a)
+### Slice 1: **Thin run registry + tool audit trail** (PLY-165a)
 
-**Goal:** One durable `run_id` per Linear agent turn (or per session — decide below) with lifecycle API, without changing the thin-adapter architecture.
+**Goal:** One durable `run_id` per Linear agent turn (or per session — decide below) with lifecycle tracking and a thin tool audit log, without changing the thin-adapter architecture.
 
 **Scope:**
 
-1. **Hermes API** (or adapter-side interim): `POST /v1/runs`, `PATCH /v1/runs/{id}`, `GET /v1/runs`, `GET /v1/runs/{id}`
-   - Fields: `run_id`, `state`, `trigger` (`linear.session.created` | `linear.session.prompted` | …), `linear_session_id`, `issue_id`, `hermes_session_id`, `started_at`, `ended_at`, `error`, `metadata` (model, team_id)
-2. **Adapter hooks** in `TaskProcessor` / `AgentWebhookHandler`:
+1. **Run registry API** (Hermes API preferred; adapter-side SQLite acceptable as interim):
+   - `POST /v1/runs`, `PATCH /v1/runs/{id}`, `GET /v1/runs`, `GET /v1/runs/{id}`
+   - Fields: `run_id`, `state` (`created` → `running` → `completed` | `failed` | `cancelled`), `trigger`, `linear_session_id`, `issue_id`, `hermes_session_id`, `started_at`, `ended_at`, `error`, `metadata` (model, team_id)
+2. **Thin tool audit trail** (same slice, not deferred):
+   - Append structured events from existing Hermes SSE parser: `tool_name`, summary, status, timestamp
+   - Stored on run record or as `run.events[]` — queryable via `GET /v1/runs/{id}`
+   - Emitted in parallel with `DiscoveryTracker` (timeline stays curated; audit log stays complete)
+3. **Adapter hooks** in `TaskProcessor` / `AgentWebhookHandler`:
    - Create run on task start; transition on complete/fail/cancel
-   - Append structured tool events from existing SSE parser (parallel to DiscoveryTracker)
-3. **Linear UX (light):**
-   - Final `response` activity footer: `Run: <short-id>` linking to Hermes dashboard or `GET /v1/runs/{id}` JSON
-4. **Ops:**
+4. **Linear UX (minimal):**
+   - Optional `run_id` in final `response` activity footer for correlation
+   - Linear timeline remains primary inspection surface
+5. **Ops:**
    - `journalctl` correlation via `run_id` in log context
+   - `GET /v1/runs/{id}` JSON sufficient for debugging — no new UI required
 
-**Out of scope for slice 1:** schedules, Docker environments, multi-agent DAG, new web UI, billing.
+**Out of scope for slice 1:** headless triggers, schedules, Docker environments, multi-agent DAG, dashboard UI, billing.
 
 **Success criteria:**
 
-- Operator can answer “what did the agent do on PLY-XX last Tuesday?” without exporting Hermes session JSON manually
-- Failed runs have structured `error` + last tool invocation
+- Operator can answer “what did the agent do on PLY-XX last Tuesday?” via run API without manual Hermes session export
+- Failed runs have structured `error` + tool audit trail showing last invocation
 - Restarting `linear-agent` does not lose in-flight run metadata (persisted store)
 
 **Estimated invasiveness:** Small–medium in adapter; medium in Hermes API if run store lives there (preferred).
 
-### Slice 2 (fast follow): **Generic webhook trigger** (PLY-165b)
+### Slice 2: **Headless trigger** (PLY-165b) — after registry, when use case exists
 
-`POST /v1/runs` with `{ "prompt", "issue_id"?, "callback"? }` for CI/GitHub Action — reuses `TaskProcessor` headless path, creates Linear session optionally.
+`POST /v1/runs` with `{ "prompt", "issue_id"?, "callback"? }` for CI/GitHub Action — reuses `TaskProcessor` headless path, creates Linear session optionally. **Gate:** require a concrete integration request before building.
 
-### Slice 3 (later): **Scheduled triage** (PLY-165c)
+### Slice 3: **Scheduled triage** (PLY-165c) — on top of slices 1 + 2
 
-Hermes cron or external scheduler → slice 2 API with Linear label/filter query.
+External scheduler or Hermes cron → headless trigger API with Linear label/filter query.
+
+### Slice 4: **Dedicated dashboard** (PLY-165d) — only if Linear stops being enough
+
+Run list/filter UI in Hermes dashboard. Deferred until cross-issue ops or transcript depth exceeds what Linear activities + run API JSON provide.
 
 ---
 
@@ -276,17 +316,16 @@ Hermes cron or external scheduler → slice 2 API with Linear label/filter query
 
 ## Recommended follow-up issues
 
-| ID | Title | Priority |
-|----|-------|----------|
-| **PLY-165a** | Hermes `/v1/runs` lifecycle API + Linear adapter correlation | **P0** — first slice |
-| **PLY-165b** | Headless run trigger API (CI / generic webhook) | P1 |
-| **PLY-165c** | Scheduled agent runs (label/project triage) | P2 |
-| **PLY-165d** | Run detail UI in Hermes dashboard (list, filter, transcript) | P1 (depends on 165a) |
-| **PLY-165e** | Structured tool audit log (parallel to DiscoveryTracker) | P1 |
-| **PLY-165f** | Execution environments MVP (worktree or Docker) | P2 |
-| **PLY-165g** | Reconcile CodingBridge README with implementation | P2 |
-| **PLY-165h** | Per-run cost/token metrics on run record | P2 |
-| **PLY-165i** | Multi-agent child runs (parent/child run_id, sub-issues) | P3 |
+| ID | Title | Priority | Notes |
+|----|-------|----------|-------|
+| **PLY-165a** | Thin run registry + tool audit trail + Linear correlation | **P0** | Foundational — registry and audit ship together |
+| **PLY-165b** | Headless run trigger API (CI / generic webhook) | P1 | After 165a; gate on concrete use case |
+| **PLY-165c** | Scheduled agent runs (label/project triage) | P2 | Built on 165a + 165b |
+| **PLY-165d** | Run detail UI in Hermes dashboard | P3 | Only if Linear proves insufficient |
+| **PLY-165e** | Per-run cost/token metrics on run record | P3 | Nice-to-have on run record |
+| **PLY-165f** | Execution environments (worktree or Docker) | Deferred | Not in near-term scope |
+| **PLY-165g** | Reconcile CodingBridge README with implementation | P3 | Docs hygiene |
+| **PLY-165h** | Multi-agent child runs (parent/child run_id) | Deferred | Not in near-term scope |
 
 ---
 
@@ -300,7 +339,7 @@ Hermes cron or external scheduler → slice 2 API with Linear label/filter query
 | Product vs implementation? | Runs page = product; event schema = implementation |
 | UX impact? | Run links + ops catalog; keep timeline curated |
 | Telemetry needed? | Lifecycle events, tool audit, token/cost, correlation IDs |
-| Minimal first ship? | **PLY-165a** run registry + Linear correlation |
+| Minimal first ship? | **PLY-165a** thin run registry + tool audit trail + Linear correlation |
 | Constraints? | Self-hosted trust model, Linear ACLs, LLM cost, single-node scale |
 | Adjacent capabilities? | Slack gateway, dashboard, Cursor bridge, MCP/secrets centralization |
 
@@ -308,4 +347,4 @@ Hermes cron or external scheduler → slice 2 API with Linear label/filter query
 
 ## Paste-ready Linear comment
 
-> **PLY-165 investigation complete.** Compared Warp Oz cloud agents to Hermes Linear agent. We already match well on Linear-native triggers, live tool progress, plans, and issue-context depth. Main gaps vs a true agent platform: **durable run records**, **programmatic run APIs**, **schedules/generic triggers**, and **reproducible environments**. Recommended first slice: **Hermes `/v1/runs` + Linear session correlation** (backlog item now filed as PLY-165a). Full map: `docs/PLY-165-warp-cloud-agents-capability-map.md`.
+> **PLY-165 investigation complete.** Compared Warp Oz cloud agents to Hermes Linear agent. We already match well on Linear-native triggers, live tool progress, plans, and issue-context depth. Main gaps: **durable run records** and **inspectable audit trail**. Agreed follow-up order: (1) thin run registry + tool audit trail, (2) headless triggers when a concrete use case exists, (3) scheduled triage on top, (4) dashboard only if Linear stops being enough. Deferred: Docker environments, multi-agent orchestration, large platform build-out. Full map: `docs/PLY-165-warp-cloud-agents-capability-map.md`.
