@@ -433,6 +433,13 @@ query Projects {
 }
 """
 
+GQL_ISSUE_SESSIONS = """
+query IssueAgentSessions($issueId: String!, $first: Int!) {
+  agentSessions(filter: { issueId: { eq: $issueId } }, first: $first) {
+    nodes { id }
+  }
+}
+"""
 GQL_PROJECT_CREATE = """
 mutation ProjectCreate($input: ProjectCreateInput!) {
   projectCreate(input: $input) {
