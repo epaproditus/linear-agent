@@ -2874,7 +2874,25 @@ class TaskProcessor:
             if user_request.strip():
                 parts.append(user_request.strip())
             tail: list[str] = []
-            if gate_mode:
+            if AGENT_ROLE == "worker":
+                # Worker: no analysis/exploration/follow-up-pass framing —
+                # just execute the issue per the hard-gate at top of prompt.
+                tail.extend([
+                    HERMES_NATIVE_TODO_HINT,
+                    (
+                        "LINEAR_API_KEY is available as $LINEAR_API_KEY for "
+                        "GraphQL calls to api.linear.app if needed."
+                    ),
+                    LINEAR_OUTPUT_RULES,
+                    # Hard-gate reinforcement — last thing before the model responds.
+                    "HARD GATE: Your ONLY job is to implement this issue. "
+                    "Do not analyze approaches, compare alternatives, or ask "
+                    "clarifying design questions. If the issue or comments "
+                    "recommend a specific approach, execute it directly. "
+                    "If acceptance criteria are unclear, make a reasonable "
+                    "assumption and note it in the PR.",
+                ])
+            elif gate_mode:
                 tail.append(GATE_ISSUE_HINT)
             else:
                 tail.extend([
@@ -2885,29 +2903,31 @@ class TaskProcessor:
                         "firewall, or package changes."
                     ),
                 ])
-            tail.extend([
-                (
-                    "LINEAR_API_KEY is available as $LINEAR_API_KEY for "
-                    "GraphQL calls to api.linear.app if needed."
-                ),
-                LINEAR_OUTPUT_RULES,
-                (
-                    "Investigate with your tools. Tool progress appears on "
-                    "the Linear timeline"
-                    + (
-                        "; reply with recommendations for Abraham to decide."
-                        if gate_mode
-                        else "; a follow-up pass may rewrite your final reply "
-                        "for the user."
-                    )
-                ),
-            ])
+                tail.extend([
+                    (
+                        "LINEAR_API_KEY is available as $LINEAR_API_KEY for "
+                        "GraphQL calls to api.linear.app if needed."
+                    ),
+                    LINEAR_OUTPUT_RULES,
+                    (
+                        "Investigate with your tools. Tool progress appears on "
+                        "the Linear timeline"
+                        + (
+                            "; reply with recommendations for Abraham to decide."
+                            if gate_mode
+                            else "; a follow-up pass may rewrite your final reply "
+                            "for the user."
+                        )
+                    ),
+                ])
             parts.extend(tail)
             return "\n\n".join(p for p in parts if p)
 
         # Follow-up — Slack gateway shape: anchor + thread context + new message.
         parts = [
-            f"{ARCHITECT_PROMPT}" if ARCHITECT_PROMPT else "",
+            f"{ARCHITECT_PROMPT}" if ARCHITECT_PROMPT else (
+                f"{WORKER_PROMPT}" if AGENT_ROLE == "worker" and WORKER_PROMPT else ""
+            ),
             f"[Replying on Linear issue {identifier} — {title}]",
         ]
         if thread_context.strip():
@@ -2916,6 +2936,13 @@ class TaskProcessor:
             parts.append(user_request.strip())
         if gate_mode:
             parts.append(GATE_ISSUE_HINT)
+        elif AGENT_ROLE == "worker":
+            # Reinforce hard-gate on follow-up turns too.
+            parts.append(
+                "HARD GATE: Your ONLY job is to implement this issue. "
+                "Do not analyze approaches, compare alternatives, or ask "
+                "clarifying design questions."
+            )
         return "\n\n".join(p for p in parts if p)
 
     async def _sync_plan_from_hermes_todos(
