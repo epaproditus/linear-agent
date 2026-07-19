@@ -254,6 +254,9 @@ class Settings(BaseSettings):
     linear_defer_on_blockers: bool = True
     """Refuse new work on created turns when blocked by unfinished issues."""
 
+    linear_oauth_token: str = ""
+    """OAuth access token for agentSessionCreateOnIssue (required over API key)."""
+
     @property
     def linear_auth_key(self) -> str:
         """Best available auth: OAuth token > API key."""
@@ -478,7 +481,7 @@ mutation ProjectCreate($input: ProjectCreateInput!) {
 """
 
 GQL_CREATE_SESSION_ON_ISSUE = """
-mutation AgentSessionCreateOnIssue($input: AgentSessionCreateOnIssueInput!) {
+mutation AgentSessionCreateOnIssue($input: AgentSessionCreateOnIssue!) {
   agentSessionCreateOnIssue(input: $input) {
     success
     agentSession { id }
@@ -580,11 +583,45 @@ class LinearClient:
         return self._client
 
     async def _gql(
-        self, query: str, variables: dict[str, Any] | None = None
+        self, query: str, variables: dict[str, Any] | None = None,
+        auth_token: str | None = None,
     ) -> dict[str, Any]:
-        """Execute a GraphQL query/mutation and return the data."""
+        """Execute a GraphQL query/mutation and return the data.
+
+        If ``auth_token`` is provided, use it as the Authorization header
+        instead of the instance's API key (for operations that require
+        OAuth, such as agentSessionCreateOnIssue).
+        """
+        if auth_token is not None:
+            # One-off request with a different auth header
+            async with httpx.AsyncClient(
+                base_url=LINEAR_GRAPHQL_URL,
+                headers={
+                    "Authorization": f"Bearer {auth_token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "HermesLinearAgent/1.0",
+                },
+                timeout=httpx.Timeout(30.0),
+            ) as client:
+                payload: dict[str, Any] = {"query": query}
+                if variables:
+                    payload["variables"] = variables
+                resp = await client.post("", json=payload)
+                body = resp.json()
+                if "errors" in body:
+                    raise RuntimeError(
+                        f"GraphQL error: {body['errors']} "
+                        f"(query: {query[:120]}...)"
+                    )
+                return body.get("data", {})
+
+        # Fall back to OAuth token when available (required for agent operations)
+        oauth_token = settings.linear_oauth_token
+        if oauth_token:
+            return await self._gql(query, variables, auth_token=oauth_token)
+
         client = await self._get_client()
-        payload: dict[str, Any] = {"query": query}
+        payload = {"query": query}
         if variables:
             payload["variables"] = variables
 
@@ -3682,6 +3719,64 @@ class AgentWebhookHandler:
             window_s=RATE_LIMIT_WINDOW_S,
         )
 
+    # ── Pipeline stage routes ────────────────────────────────────────
+    # Maps Linear state name → stage name, next state, and scoped guidance.
+    # Stage guidance is injected into the Hermes session, restricting the
+    # agent to that stage's scope only.
+    PIPELINE_STAGES: dict[str, dict[str, Any]] = {
+        "needs triage": {
+            "name": "triage-gate",
+            "next_state": "ready",
+            "guidance": [
+                "You are the TRIAGE GATE. Your ONLY job is a quick check of whether",
+                "the issue is well-formed before it enters the pipeline. Verify:",
+                "(1) A repo or project is referenced, (2) The problem or request is",
+                "clearly stated, (3) No obvious duplicates or blockers. Do NOT",
+                "investigate the codebase, do NOT propose solutions, do NOT plan",
+                "implementation. Just check if it passes the gate. Output a single",
+                "comment with verdict: 'Triaged: ready for scoping' and set state",
+                "to Ready, or 'Blocked: <reason>' and set state to Blocked. Done.",
+            ],
+        },
+        "ready": {
+            "name": "triage",
+            "next_state": "planned",
+            "guidance": [
+                "You are the TRIAGE stage of a pipeline. Your ONLY job is to "
+                "verify the issue is ready for implementation. Check: (1) A repo "
+                "is referenced, (2) Acceptance criteria are clear, (3) Scope is "
+                "bounded to specific files/components. Do NOT write code, implement "
+                "anything, or plan implementation. Output a single comment with "
+                "verdict 'Ready: <reason>' or 'Blocked: <reason>', then update the "
+                "issue state to Planned (if ready) or Blocked (if not). Done.",
+            ],
+        },
+        "planned": {
+            "name": "execute",
+            "next_state": "in review",
+            "guidance": [
+                "You are the EXECUTE stage of a pipeline. Implement the changes "
+                "described in the issue and any Plan comment. Clone the relevant "
+                "repo, make changes, write/run tests, commit, push, and open a "
+                "GitHub PR. Reference the issue identifier. Do NOT do scope analysis, "
+                "triage, or review — just implement. When done, update the issue "
+                "state to 'In Review'.",
+            ],
+        },
+        "in review": {
+            "name": "review",
+            "next_state": "done",
+            "guidance": [
+                "You are the REVIEW stage of a pipeline. Your ONLY job: review the "
+                "linked PR diff and any deployment/endpoint output. Check for: "
+                "correctness, security, test coverage, and whether acceptance criteria "
+                "are met. Do NOT write new code — only review. Output a comment with "
+                "verdict and update the issue state to Done (if approved) or back to "
+                "Planned (if changes needed). Done.",
+            ],
+        },
+    }
+
     def _check_dedup(self, key: str, ttl: float = 60.0) -> bool:
         """Returns True if this event was recently processed."""
         now = time.time()
@@ -3939,9 +4034,10 @@ class AgentWebhookHandler:
         # Create a proactive agent session on the issue
         log.info("Creating agent session for @mention on issue %s", issue_id)
         try:
+            oauth = settings.linear_oauth_token or None
             data = await self.linear._gql(GQL_CREATE_SESSION_ON_ISSUE, {
                 "input": {"issueId": issue_id},
-            })
+            }, auth_token=oauth)
             session_data = data.get("agentSessionCreateOnIssue", {})
             if session_data.get("success"):
                 session_id = session_data["agentSession"]["id"]
@@ -3995,17 +4091,30 @@ class AgentWebhookHandler:
         except Exception:
             return "could not check assignment"
 
+        # Extract state name for pipeline routing and for dedup key
+        state_name = (payload.get("state", {}).get("name", "") or
+                      payload.get("issue", {}).get("state", {}).get("name", "")).lower()
+
         # Skip terminal states — don't re-process completed/canceled issues
         state_type = payload.get("state", {}).get("type", "") or payload.get("issue", {}).get("state", {}).get("type", "")
         if state_type in ("completed", "canceled"):
             return f"skipped ({state_type} issue)"
 
+        # ── Pipeline stage routing ──
+        # If the issue is assigned to us AND in a known pipeline state,
+        # attach stage-scoped guidance to restrict the agent's scope.
+        pipeline_stage = self.PIPELINE_STAGES.get(state_name)
+        if pipeline_stage:
+            log.info("Pipeline stage '%s' for issue %s (state=%s)",
+                     pipeline_stage["name"], issue_id, state_name)
+
         log.info("Issue %s assigned to agent", issue_id)
         # Create an agent session proactively
         try:
+            oauth = settings.linear_oauth_token or None
             data = await self.linear._gql(GQL_CREATE_SESSION_ON_ISSUE, {
                 "input": {"issueId": issue_id},
-            })
+            }, auth_token=oauth)
             session_data = data.get("agentSessionCreateOnIssue", {})
             if session_data.get("success"):
                 session_id = session_data["agentSession"]["id"]
@@ -4020,6 +4129,12 @@ class AgentWebhookHandler:
                         )
                         return "ignored (team not in allowlist)"
                 if issue:
+                    # ── Pipeline stage guidance ──
+                    stage_guidance = pipeline_stage.get("guidance", []) if pipeline_stage else []
+                    if stage_guidance:
+                        log.info("Injecting %s guidance into session %s",
+                                 pipeline_stage["name"], session_id[:8])
+
                     session = AgentSession(
                         session_id=session_id,
                         issue_id=issue_id,
@@ -4034,9 +4149,11 @@ class AgentWebhookHandler:
                         labels=[l["name"] for l in
                                 (issue.get("labels", {}).get("nodes", []) or [])],
                         state_type=issue.get("state", {}).get("type", ""),
+                        guidance=stage_guidance,
                     )
                     asyncio.create_task(self._process_with_semaphore(session, issue))
-                    return f"processing assignment (session={session_id[:8]}...)"
+                    stage_tag = f" (pipeline: {pipeline_stage['name']})" if pipeline_stage else ""
+                    return f"processing assignment{stage_tag} (session={session_id[:8]}...)"
         except Exception as e:
             log.exception("Failed to handle assignment")
             return f"error: {e}"
