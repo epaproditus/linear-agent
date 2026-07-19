@@ -206,7 +206,7 @@ RATE_LIMIT_MAX_REQUESTS = 30   # Max webhook requests per window
 class Settings(BaseSettings):
     """Environment-based configuration."""
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "allow"}
 
     linear_api_key: str = ""
     """Linear API key (OAuth access token or personal API key)."""
