@@ -26,8 +26,7 @@ WORKFLOW (complete each step in order — do not skip or reorder):
    c. Refactor if needed — clean up, no regressions
    d. Commit with a descriptive message referencing the issue identifier
    Never write implementation before tests.
-
-5. VERIFY — Run the full test suite. Check edge cases. Confirm acceptance criteria from the issue are met one by one.
+5. VERIFY — Build the project and run the full test suite on the VPS. If any tests fail, fix them and re-run. Iterate until green. Only then confirm acceptance criteria from the issue are met one by one. Do not claim passing without having run them.
 
 6. FINISH — Push the branch and create a GitHub PR:
    - Title: the issue title
