@@ -145,6 +145,40 @@ Human gate issue — help Abraham decide, do not execute:
 - Summarize choices for Abraham to confirm in a comment.
 """.strip()
 
+# Agent role — determines which prompt/methodology is loaded.
+# Set via AGENT_ROLE env var: "architect" (default, requires architect_prompt.txt),
+# "worker" (requires worker_prompt.txt), or "legacy" (no role prompt, uses HERMES_WORK_STYLE).
+AGENT_ROLE = os.environ.get("AGENT_ROLE", "").strip().lower() or (
+    "architect"  # default when no ARCHITECT_PROMPT override is needed
+)
+
+# Architect role prompt — loaded from file so it can be edited without touching Python.
+_ARCHITECT_PROMPT_PATH = Path(__file__).parent / "architect_prompt.txt"
+ARCHITECT_PROMPT: str = (
+    _ARCHITECT_PROMPT_PATH.read_text(encoding="utf-8")
+    if _ARCHITECT_PROMPT_PATH.is_file()
+    else ""
+).strip()
+
+# Worker role prompt — full Superpowers execution methodology.
+_WORKER_PROMPT_PATH = Path(__file__).parent / "worker_prompt.txt"
+WORKER_PROMPT: str = (
+    _WORKER_PROMPT_PATH.read_text(encoding="utf-8")
+    if _WORKER_PROMPT_PATH.is_file()
+    else ""
+).strip()
+
+# If AGENT_ROLE is "worker", suppress the Architect prompt.
+if AGENT_ROLE == "worker":
+    ARCHITECT_PROMPT = ""
+
+# Determine the effective methodology / work style for the active role.
+_ROLE_WORK_STYLE: str = (
+    WORKER_PROMPT
+    if AGENT_ROLE == "worker" and WORKER_PROMPT
+    else HERMES_WORK_STYLE
+)
+
 WATERMARK_STORE_DIR = Path.home() / ".linear-agent"
 WATERMARK_STORE_PATH = WATERMARK_STORE_DIR / "conversation_watermarks.json"
 
@@ -2619,7 +2653,7 @@ class TaskProcessor:
             )
 
         plan_block = ""
-        if plan_steps:
+        if plan_steps and not ARCHITECT_PROMPT:
             plan_block = (
                 "\nYour plan for this issue (follow in order — complete context "
                 "review steps before shell or system changes):\n"
@@ -2638,8 +2672,39 @@ class TaskProcessor:
         )
         gate_block = f"\n{GATE_ISSUE_HINT}\n" if gate_mode else ""
 
+        arch_block = f"\n{ARCHITECT_PROMPT}\n" if ARCHITECT_PROMPT else ""
         if session.action == SessionAction.prompted:
             # Follow-up turn — continue the work/conversation in this thread
+            if ARCHITECT_PROMPT:
+                # Clean Architect-only prompted prompt — no Hermes context.
+                # Skips tool availability, HERMES_WORK_STYLE, plan, API key hints,
+                # and prior-session activity (internal_text) that would prime
+                # investigation behavior.
+                return (
+                    f"You are the Architect, working inside Linear.\n"
+                    f"{arch_block}"
+                    f"\n"
+                    f"LINEAR_API_KEY is available as $LINEAR_API_KEY "
+                    f"in the environment for GraphQL calls to api.linear.app.\n"
+                    f"\n"
+                    f"Issue: {identifier} — {title}\n"
+                    f"Team: {team_name}"
+                    f"{f' ({team_key})' if team_key else ''}\n"
+                    f"Labels: {', '.join(labels) or 'none'}\n"
+                    f"\n"
+                    f"Conversation so far:\n{conversation_text}\n"
+                    f"{gate_block}"
+                    f"\n"
+                    f"User: {user_request}\n"
+                    f"\n"
+                    f"Continue the Architect workflow from where you left off. "
+                    f"The user has responded to your previous message. "
+                    f"Move to the next appropriate step in the workflow. "
+                    f"When creating issues, use the Linear GraphQL API. "
+                    f"Do NOT explore the filesystem (no ls, find, cat, grep). "
+                    f"Do NOT search the web. "
+                    f"Do NOT implement or execute code."
+                )
             return (
                 f"You are Hermes, an autonomous agent working on Linear"
                 f" issue {identifier} — {title}.\n"
@@ -2662,20 +2727,47 @@ class TaskProcessor:
                 f"{plan_block}"
                 f"User: {user_request}\n"
                 f"\n"
-                f"Investigate with your tools, then produce a thorough internal"
-                f" draft. Tool actions appear on the Linear timeline as they"
-                f" run; a separate pass will write the user-facing reply.\n"
                 f"{gate_block}"
                 f"\n"
-                f"{HERMES_WORK_STYLE}\n"
+                f"{_ROLE_WORK_STYLE}\n"
                 f"\n"
-                f"Respond to the new message. If it asks you to do something,"
+                f"Respond to the new message. "
+                f"If it asks you to do something,"
                 f" do it now with your tools and report the result."
                 f" If it's casual conversation, just reply naturally."
                 f" Do not repeat your previous messages."
             )
         else:
             # User @mentioned Hermes or delegated an issue — do the task
+            if ARCHITECT_PROMPT:
+                # Clean Architect-only prompt — no Hermes implementation context.
+                # Removes tool availability, HERMES_WORK_STYLE, plan, and
+                # investigation instructions that contradict the Architect role.
+                return (
+                    f"You are the Architect, working inside Linear.\n"
+                    f"{arch_block}"
+                    f"\n"
+                    f"LINEAR_API_KEY is available as $LINEAR_API_KEY "
+                    f"in the environment for GraphQL calls to api.linear.app.\n"
+                    f"\n"
+                    f"Issue: {identifier} — {title}"
+                    f" | Status: {state.get('name', 'Unknown')}\n"
+                    f"Team: {team_name}"
+                    f"{f' ({team_key})' if team_key else ''}\n"
+                    f"Labels: {', '.join(labels) or 'none'}\n"
+                    f"Description: {description or '(no description)'}\n"
+                    f"\n"
+                    f"{context_sections}"
+                    f"{gate_block}"
+                    f"\n"
+                    f"Follow the Architect workflow above. "
+                    f"Start at step 1 and work through to step 2. "
+                    f"Your ONLY job right now is to read the issue and "
+                    f"ask ONE clarifying question. "
+                    f"Do NOT explore the filesystem (no ls, find, cat, grep). "
+                    f"Do NOT search the web. "
+                    f"Do NOT implement or execute code."
+                )
             return (
                 f"You are Hermes, an autonomous agent working inside Linear.\n"
                 f"The Hermes API server runs tools (filesystem, shell, web"
@@ -2699,15 +2791,12 @@ class TaskProcessor:
                 f"{plan_block}"
                 f"User: {user_request}\n"
                 f"\n"
-                f"Investigate with your tools, then produce a thorough internal"
-                f" draft. Tool actions appear on the Linear timeline as they"
-                f" run; a separate pass will write the user-facing reply.\n"
                 f"{gate_block}"
                 f"\n"
-                f"{HERMES_WORK_STYLE}\n"
+                f"{_ROLE_WORK_STYLE}\n"
                 f"\n"
-                f"Do what needs to be done. Use your tools and report what you"
-                f" actually did and found. If it's casual or needs discussion,"
+                f"Do what needs to be done. Use your tools and report what"
+                f" you actually did and found. If it's casual or needs discussion,"
                 f" just reply naturally. Do not ask for confirmation before"
                 f" starting. Be concise. Do not introduce yourself or list"
                 f" capabilities."
@@ -2750,6 +2839,9 @@ class TaskProcessor:
             )
             guidance_block = format_guidance_block(session.guidance)
             parts = [
+                f"{ARCHITECT_PROMPT}" if ARCHITECT_PROMPT else (
+                    f"{WORKER_PROMPT}" if AGENT_ROLE == "worker" and WORKER_PROMPT else ""
+                ),
                 f"Linear assignment: {identifier} — {title}",
                 f"Status: {state.get('name', 'Unknown')}",
                 f"Team: {team_name}{f' ({team_key})' if team_key else ''}",
@@ -2799,10 +2891,11 @@ class TaskProcessor:
                 ),
             ])
             parts.extend(tail)
-            return "\n\n".join(parts)
+            return "\n\n".join(p for p in parts if p)
 
         # Follow-up — Slack gateway shape: anchor + thread context + new message.
         parts = [
+            f"{ARCHITECT_PROMPT}" if ARCHITECT_PROMPT else "",
             f"[Replying on Linear issue {identifier} — {title}]",
         ]
         if thread_context.strip():
@@ -2811,7 +2904,7 @@ class TaskProcessor:
             parts.append(user_request.strip())
         if gate_mode:
             parts.append(GATE_ISSUE_HINT)
-        return "\n\n".join(parts)
+        return "\n\n".join(p for p in parts if p)
 
     async def _sync_plan_from_hermes_todos(
         self,
@@ -3067,15 +3160,18 @@ class TaskProcessor:
 
             skills_context = await self._fetch_hermes_skills_context()
 
-            hermes_steps = await self._call_llm_plan(
-                identifier=identifier,
-                title=title,
-                user_request=user_request,
-                description=description,
-                session_id=session_id,
-                skills_context=skills_context,
-                project_block=project_block,
-                conversation_summary=summarize_conversation_text(conversation_text),
+            hermes_steps = (
+                [] if ARCHITECT_PROMPT
+                else await self._call_llm_plan(
+                    identifier=identifier,
+                    title=title,
+                    user_request=user_request,
+                    description=description,
+                    session_id=session_id,
+                    skills_context=skills_context,
+                    project_block=project_block,
+                    conversation_summary=summarize_conversation_text(conversation_text),
+                )
             )
             if hermes_steps:
                 await plan.set_from_hermes(hermes_steps)
