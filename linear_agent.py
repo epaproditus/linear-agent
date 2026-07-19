@@ -209,7 +209,11 @@ class Settings(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "allow"}
 
     linear_api_key: str = ""
-    """Linear API key (OAuth access token or personal API key)."""
+    """Linear API key (personal API key). Some operations (agent sessions, activities) require OAuth token."""
+
+    linear_oauth_token: str = ""
+    """Linear OAuth access token. Required for Agent Session & Activity API operations.
+    Preferred over ``linear_api_key`` when both are set."""
 
     linear_webhook_secret: str = ""
     """HMAC signing secret from Linear webhook settings."""
@@ -251,6 +255,11 @@ class Settings(BaseSettings):
     """Refuse new work on created turns when blocked by unfinished issues."""
 
     @property
+    def linear_auth_key(self) -> str:
+        """Best available auth: OAuth token > API key."""
+        return self.linear_oauth_token or self.linear_api_key
+
+    @property
     def allowed_team_ids(self) -> set[str]:
         """Team IDs from LINEAR_TEAM_IDS and/or ALLOWED_TEAM_IDS."""
         ids: set[str] = set()
@@ -273,14 +282,17 @@ class Settings(BaseSettings):
 
     @property
     def configured(self) -> bool:
-        return bool(self.linear_api_key) and bool(self.linear_webhook_secret)
+        return bool(self.linear_webhook_secret) and (
+            bool(self.linear_api_key) or bool(self.linear_oauth_token)
+        )
 
 
 settings = Settings()
 
 # Safety: don't run without config
 assert settings.configured, (
-    "LINEAR_API_KEY and LINEAR_WEBHOOK_SECRET must be set. "
+    "LINEAR_WEBHOOK_SECRET must be set, and either LINEAR_API_KEY or "
+    "LINEAR_OAUTH_TOKEN must be set. "
     "Copy .env.example to .env and fill in your credentials."
 )
 
@@ -4022,7 +4034,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
 
     # Create shared clients
-    linear = LinearClient(settings.linear_api_key)
+    linear = LinearClient(settings.linear_auth_key)
     processor = TaskProcessor(linear)
     handler = AgentWebhookHandler(linear, processor)
 
