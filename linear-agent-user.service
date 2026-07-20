@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 WorkingDirectory=/home/abe/linear-agent
 EnvironmentFile=/home/abe/linear-agent/.env
-Environment=AGENT_ROLE=architect
+Environment=AGENT_ROLE=worker
 ExecStartPre=/bin/sh -c 'pid=$(ss -tlnp sport = :8660 2>/dev/null | grep -o "pid=[0-9]*" | grep -o "[0-9]*" | head -1) && [ -n "$pid" ] && kill "$pid" 2>/dev/null && echo "killed stale PID $pid on 8660" || true'
 ExecStart=/home/abe/linear-agent/.venv/bin/uvicorn linear_agent:app --host 0.0.0.0 --port 8660 --log-level info
 Restart=always
