@@ -6,13 +6,16 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   PYTHON_VERSION: "3.12"
 
 jobs:
   ci:
     name: CI — Tests & Lint
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,53 +40,30 @@ jobs:
           LINEAR_API_KEY: test-key
           LINEAR_WEBHOOK_SECRET: test-secret
 
-  cd-architect:
-    name: Deploy — Architect (droplet)
+  deploy:
+    name: Deploy
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    environment: production
+    needs: [ci]
+    strategy:
+      matrix:
+        target:
+          - name: Architect
+            label: architect
+            path: /root/linear-agent
+          - name: Worker
+            label: worker
+            path: /home/abe/linear-agent
+    runs-on: [self-hosted, "${{ matrix.target.label }}"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy to architect VPS
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.ARCHITECT_HOST }}
-          port: ${{ secrets.ARCHITECT_PORT || '22' }}
-          username: ${{ secrets.ARCHITECT_USER || 'root' }}
-          key: ${{ secrets.ARCHITECT_SSH_KEY }}
-          script: |
-            set -e
-            cd /root/linear-agent
-            git fetch origin main
-            git checkout main
-            git reset --hard origin/main
-            .venv/bin/pip install -r requirements.txt
-            systemctl restart linear-agent.service
-            echo "=== Deployed architect (commit $(git rev-parse --short HEAD)) ==="
-
-  cd-worker:
-    name: Deploy — Worker (abe VPS)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    environment: production
-    needs: [cd-architect]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Deploy to worker VPS
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.WORKER_HOST }}
-          port: ${{ secrets.WORKER_PORT || '22' }}
-          username: ${{ secrets.WORKER_USER || 'abe' }}
-          key: ${{ secrets.WORKER_SSH_KEY }}
-          script: |
-            set -e
-            cd /home/abe/linear-agent
-            git fetch origin main
-            git checkout main
-            git reset --hard origin/main
-            .venv/bin/pip install -r requirements.txt
-            sudo systemctl restart linear-agent.service
-            echo "=== Deployed worker (commit $(git rev-parse --short HEAD)) ==="
+      - name: Deploy
+        run: |
+          set -e
+          DEPLOY_DIR="${{ matrix.target.path }}"
+          cd "$DEPLOY_DIR"
+          git fetch origin main
+          git reset --hard origin/main
+          "$DEPLOY_DIR/.venv/bin/pip" install -r requirements.txt
+          systemctl restart linear-agent.service
+          echo "=== Deployed ${{ matrix.target.name }} (commit $(git rev-parse --short HEAD)) ===
